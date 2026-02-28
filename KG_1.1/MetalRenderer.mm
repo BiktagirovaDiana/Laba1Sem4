@@ -274,6 +274,19 @@ void MetalRenderer::LoadObjMesh()
 
     m_indexCount = (uint32_t)mesh.indices.size();
 
+    // Bounds in object space are used to make texture animation speed depend on camera distance.
+    m_meshAabbMin = simd::float3{mesh.vertices[0].px, mesh.vertices[0].py, mesh.vertices[0].pz};
+    m_meshAabbMax = m_meshAabbMin;
+    for (const VertexPNT& v : mesh.vertices)
+    {
+        if (v.px < m_meshAabbMin.x) m_meshAabbMin.x = v.px;
+        if (v.py < m_meshAabbMin.y) m_meshAabbMin.y = v.py;
+        if (v.pz < m_meshAabbMin.z) m_meshAabbMin.z = v.pz;
+        if (v.px > m_meshAabbMax.x) m_meshAabbMax.x = v.px;
+        if (v.py > m_meshAabbMax.y) m_meshAabbMax.y = v.py;
+        if (v.pz > m_meshAabbMax.z) m_meshAabbMax.z = v.pz;
+    }
+
     m_vb = [m_device newBufferWithBytes:mesh.vertices.data()
                                  length:mesh.vertices.size() * sizeof(VertexPNT)
                                 options:MTLResourceStorageModeShared];
@@ -466,7 +479,33 @@ void MetalRenderer::DrawFrame()
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
         cb->cameraPos = m_camPos;
         m_timeSeconds += dt;
-        cb->timeSeconds = m_timeSeconds;
+
+        // Distance from camera to mesh AABB (0 when camera is inside/touching bounds).
+        float dx = 0.0f;
+        if (m_camPos.x < m_meshAabbMin.x) dx = m_meshAabbMin.x - m_camPos.x;
+        else if (m_camPos.x > m_meshAabbMax.x) dx = m_camPos.x - m_meshAabbMax.x;
+
+        float dy = 0.0f;
+        if (m_camPos.y < m_meshAabbMin.y) dy = m_meshAabbMin.y - m_camPos.y;
+        else if (m_camPos.y > m_meshAabbMax.y) dy = m_camPos.y - m_meshAabbMax.y;
+
+        float dz = 0.0f;
+        if (m_camPos.z < m_meshAabbMin.z) dz = m_meshAabbMin.z - m_camPos.z;
+        else if (m_camPos.z > m_meshAabbMax.z) dz = m_camPos.z - m_meshAabbMax.z;
+
+        const float distanceToObject = sqrtf(dx * dx + dy * dy + dz * dz);
+        float t = distanceToObject / m_textureFarDistance;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        // Smooth transition between "near = fast" and "far = slow".
+        const float smoothT = t * t * (3.0f - 2.0f * t);
+        const float speedMultiplier =
+            m_textureNearSpeedMultiplier +
+            (m_textureFarSpeedMultiplier - m_textureNearSpeedMultiplier) * smoothT;
+
+        m_textureAnimTimeSeconds += dt * speedMultiplier;
+        cb->timeSeconds = m_textureAnimTimeSeconds;
 
         // projection по размеру окна
         float w = (float)m_view.drawableSize.width;

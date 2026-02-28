@@ -61,6 +61,12 @@ private:
     float m_timeSeconds = 0.0f;
     simd::float2 m_textureTiling = {2.0f, 2.0f};
     simd::float2 m_textureScrollSpeed = {0.08f, 0.0f};
+    simd::float3 m_meshAabbMin = {-0.5f, -0.5f, -0.5f};
+    simd::float3 m_meshAabbMax = { 0.5f,  0.5f,  0.5f};
+    float m_textureAnimTimeSeconds = 0.0f;
+    float m_textureNearSpeedMultiplier = 4.0f;
+    float m_textureFarSpeedMultiplier = 0.35f;
+    float m_textureFarDistance = 8.0f;
 
     void CreateDeviceAndSwapchain();
     void CreateDepth();
