@@ -1,0 +1,64 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildOnly"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "9008b396d35e1aeb8299a5ab4cd6f9096b23bb764ff5cedebfdf5513d352823c"
+    }
+  ],
+  "containerPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/KG_1.1.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "arm64",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : false,
+      "platform" : "macosx",
+      "sdk" : "macosx26.2",
+      "sdkVariant" : "macos",
+      "supportedArchitectures" : [
+        "arm64e",
+        "arm64",
+        "x86_64"
+      ],
+      "targetArchitecture" : "arm64"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata/Build/Products",
+      "derivedDataPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata",
+      "indexDataStoreFolderPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/macbook/Documents/GitHub/Laba1Sem4/.deriveddata/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Debug",
+    "overrides" : {
+      "commandLine" : {
+        "table" : {
+
+        }
+      },
+      "synthesized" : {
+        "table" : {
+          "ACTION" : "build",
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}
