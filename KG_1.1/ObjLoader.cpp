@@ -128,6 +128,8 @@ bool ObjLoader::LoadMesh(const std::string& path, ObjMesh& outMesh)
             !tm.ambient_texname.empty() ? tm.ambient_texname :
             tm.specular_texname;
         m.diffuseTexPath = ResolveTexturePath(baseDir, primaryColorTex);
+        m.normalTexPath = ResolveTexturePath(baseDir, tm.normal_texname);
+        m.heightTexPath = ResolveTexturePath(baseDir, tm.bump_texname);
 
         outMesh.materials.push_back(m);
     }

@@ -18,6 +18,8 @@ struct ObjMaterial
     float ns = 32.0f;
     float d = 1.0f;
     std::string diffuseTexPath;
+    std::string normalTexPath;
+    std::string heightTexPath;
 };
 
 struct ObjSubmesh

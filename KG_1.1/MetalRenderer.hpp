@@ -4,8 +4,6 @@
 #include "DirectionalLight.hpp"
 #include "GBuffer.hpp"
 #include "ObjLoader.hpp"
-#include "PointLight.hpp"
-#include "SpotLight.hpp"
 
 class MetalRenderer
 {
@@ -29,8 +27,8 @@ private:
         simd::float4 ks_alpha = {0.0f, 0.0f, 0.0f, 1.0f};
         simd::float2 uvScale = {1.0f, 1.0f};
         simd::float2 uvSpeed = {0.0f, 0.0f};
-        uint32_t useTexture = 0;
-        simd::float3 pad = {0.0f, 0.0f, 0.0f};
+        simd::uint4 textureFlags = {0u, 0u, 0u, 0u};
+        simd::float4 detailParams = {2.0f, 1.0f, 0.0f, 0.0f};
     };
 
     struct CollisionTriangle
@@ -52,6 +50,8 @@ private:
     id<MTLRenderPipelineState> m_lightingPSO = nil;
     id<MTLDepthStencilState>   m_dss = nil;
     id<MTLTexture>             m_whiteTex = nil;
+    id<MTLTexture>             m_blackTex = nil;
+    id<MTLTexture>             m_flatNormalTex = nil;
     id<MTLSamplerState>        m_sampler = nil;
     GBuffer                    m_gbuffer;
 
@@ -65,7 +65,9 @@ private:
     std::vector<CollisionTriangle> m_collisionTriangles;
     std::vector<DrawBatch> m_batches;
     std::vector<MaterialGPU> m_materials;
-    std::vector<id<MTLTexture>> m_materialTextures;
+    std::vector<id<MTLTexture>> m_diffuseTextures;
+    std::vector<id<MTLTexture>> m_normalTextures;
+    std::vector<id<MTLTexture>> m_heightTextures;
     simd::float3 m_camPos = { 0.0f, 0.0f, 3.0f };
     float        m_camSpeed = 120.0f; // units/sec
     
@@ -83,29 +85,12 @@ private:
     simd::float3 m_meshAabbMax = { 0.5f,  0.5f,  0.5f};
     simd::float3 m_meshCenter = {0.0f, 0.0f, 0.0f};
     float m_meshRadius = 1.0f;
+    float m_tessellationStrength = 0.025;
+    float m_tessellationFadeNearMultiplier = 1.5f;
+    float m_tessellationFadeFarMultiplier = 4.5f;
     DirectionalLight m_directionalLight = DirectionalLight(simd::float3{0.0f, -1.0f, 0.0f},
                                                            simd::float3{1.0f, 1.0f, 1.0f},
                                                            1.0f);
-    PointLight m_pointLight = PointLight(simd::float3{0.0f, 0.0f, 0.0f},
-                                         1.0f,
-                                         simd::float3{1.0f, 1.0f, 1.0f},
-                                         1.0f);
-    SpotLight m_spotLight = SpotLight(simd::float3{0.0f, 0.0f, 0.0f},
-                                      simd::float3{0.0f, -1.0f, 0.0f},
-                                      1.0f,
-                                      30.0f,
-                                      simd::float3{1.0f, 1.0f, 1.0f},
-                                      1.0f);
-    simd::float3 m_thrownLightPos = {0.0f, 200.0f, 0.0f};
-    simd::float3 m_thrownLightVelocity = {0.0f, 0.0f, 0.0f};
-    simd::float3 m_thrownLightForward = {0.0f, 0.0f, -1.0f};
-    bool m_thrownLightActive = false;
-    bool m_thrownLightLanded = false;
-    float m_thrownLightGravity = 28.0f;
-    float m_thrownLightLaunchSpeed = 220.0f;
-    float m_thrownLightSpawnOffset = 12.0f;
-    float m_thrownLightInitialDropSpeed = 4.0f;
-    float m_thrownLightSurfaceOffset = 3.0f;
     float m_textureAnimTimeSeconds = 0.0f;
     float m_textureNearSpeedMultiplier = 4.0f;
     float m_textureFarSpeedMultiplier = 0.35f;
@@ -117,5 +102,5 @@ private:
     void CreateConstantBuffer();
     void LoadObjMesh();
     void CreateSamplerAndFallbackTexture();
-    id<MTLTexture> LoadTextureOrNil(const std::string& path);
+    id<MTLTexture> LoadTextureOrNil(const std::string& path, bool srgb);
 };

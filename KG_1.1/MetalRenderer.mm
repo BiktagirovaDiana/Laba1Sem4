@@ -168,16 +168,6 @@ struct CameraCB
     float          pad0;
     simd::float3   cameraPos;
     float          timeSeconds;
-    simd::float3   pointLightPos;
-    float          pointLightRange;
-    simd::float3   pointLightColor;
-    float          pointLightIntensity;
-    simd::float3   spotLightPos;
-    float          spotLightRange;
-    simd::float3   spotLightDir;
-    float          spotLightConeAngle;
-    simd::float3   spotLightColor;
-    float          spotLightIntensity;
 };
 
 static simd::float4x4 Identity()
@@ -194,22 +184,9 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateConstantBuffer();
     CreateSamplerAndFallbackTexture();
     LoadObjMesh();
-    m_directionalLight = DirectionalLight(simd::float3{-0.3f, -1.0f, -0.2f}, // направление
-                                          simd::float3{0.2f, 0.4f, 1.0f}, // цвет
-                                          //simd::float3{1.0f, 1.0f, 1.0f},
-                                          1.5f); // интенсивность
-    
-    m_pointLight = PointLight(simd::float3{0.0f, 200.0f, 0.0f}, // позиция
-                              500.0f, // радиус
-                              simd::float3{0.2f, 1.0f, 0.2f}, // цвет
-                              10.0f); // интенсивность
-    m_thrownLightPos = m_pointLight.GetPosition();
-    m_spotLight = SpotLight(simd::float3{0.0f, 40.0f, 400.0f}, // позиция
-                            simd::float3{0.0f, -1.0f, -1.0f}, // направление
-                            100, // радиус
-                            60.0f, // угол конуса в градусах
-                            simd::float3{1.0f, 0.1f, 0.1f}, // красный цвет
-                            40.0f); // интенсивность
+    m_directionalLight = DirectionalLight(simd::float3{-0.3f, -1.0f, -0.2f},
+                                          simd::float3{1.0f, 1.0f, 1.0f},
+                                          1.5f);
 }
  
 MetalRenderer::~MetalRenderer() {}
@@ -397,10 +374,14 @@ void MetalRenderer::LoadObjMesh()
 
     m_batches.clear();
     m_materials.clear();
-    m_materialTextures.clear();
+    m_diffuseTextures.clear();
+    m_normalTextures.clear();
+    m_heightTextures.clear();
     m_batches.reserve(mesh.submeshes.size());
     m_materials.reserve(mesh.materials.size());
-    m_materialTextures.reserve(mesh.materials.size());
+    m_diffuseTextures.reserve(mesh.materials.size());
+    m_normalTextures.reserve(mesh.materials.size());
+    m_heightTextures.reserve(mesh.materials.size());
 
     for (const ObjMaterial& m : mesh.materials)
     {
@@ -409,23 +390,38 @@ void MetalRenderer::LoadObjMesh()
         gpuMat.ks_alpha = simd::float4{m.ks[0], m.ks[1], m.ks[2], m.d};
         gpuMat.uvScale = m_textureTiling;
         gpuMat.uvSpeed = m_textureScrollSpeed;
+        gpuMat.detailParams = simd::float4{m_meshRadius * m_tessellationStrength, 1.0f, 0.0f, 0.0f};
 
-        id<MTLTexture> tex = nil;
+        id<MTLTexture> diffuseTex = nil;
         if (!m.diffuseTexPath.empty())
         {
-            tex = LoadTextureOrNil(m.diffuseTexPath);
+            diffuseTex = LoadTextureOrNil(m.diffuseTexPath, true);
         }
-        if (tex)
+        id<MTLTexture> normalTex = nil;
+        if (!m.normalTexPath.empty())
         {
-            gpuMat.useTexture = 1;
+            normalTex = LoadTextureOrNil(m.normalTexPath, false);
+        }
+        id<MTLTexture> heightTex = nil;
+        if (!m.heightTexPath.empty())
+        {
+            heightTex = LoadTextureOrNil(m.heightTexPath, false);
         }
 
-        NSLog(@"Material '%s': diffuseTex=%s",
+        gpuMat.textureFlags[0] = diffuseTex ? 1u : 0u;
+        gpuMat.textureFlags[1] = normalTex ? 1u : 0u;
+        gpuMat.textureFlags[2] = heightTex ? 1u : 0u;
+
+        NSLog(@"Material '%s': diffuseTex=%s normalTex=%s heightTex=%s",
               m.name.empty() ? "<default>" : m.name.c_str(),
-              m.diffuseTexPath.empty() ? "<none>" : m.diffuseTexPath.c_str());
+              m.diffuseTexPath.empty() ? "<none>" : m.diffuseTexPath.c_str(),
+              m.normalTexPath.empty() ? "<none>" : m.normalTexPath.c_str(),
+              m.heightTexPath.empty() ? "<none>" : m.heightTexPath.c_str());
 
         m_materials.push_back(gpuMat);
-        m_materialTextures.push_back(tex);
+        m_diffuseTextures.push_back(diffuseTex);
+        m_normalTextures.push_back(normalTex);
+        m_heightTextures.push_back(heightTex);
     }
 
     for (const ObjSubmesh& sm : mesh.submeshes)
@@ -438,12 +434,12 @@ void MetalRenderer::LoadObjMesh()
     }
 }
 
-id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path)
+id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path, bool srgb)
 {
     NSError* err = nil;
     MTKTextureLoader* loader = [[MTKTextureLoader alloc] initWithDevice:m_device];
     NSDictionary* options = @{
-        MTKTextureLoaderOptionSRGB : @YES,
+        MTKTextureLoaderOptionSRGB : @(srgb),
         MTKTextureLoaderOptionGenerateMipmaps : @YES
     };
     NSString* nsPath = [NSString stringWithUTF8String:path.c_str()];
@@ -472,9 +468,15 @@ void MetalRenderer::CreateSamplerAndFallbackTexture()
                                                                                mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
     m_whiteTex = [m_device newTextureWithDescriptor:td];
+    m_blackTex = [m_device newTextureWithDescriptor:td];
+    m_flatNormalTex = [m_device newTextureWithDescriptor:td];
     uint32_t pixel = 0xffffffffu;
+    uint32_t blackPixel = 0x000000ffu;
+    uint32_t flatNormalPixel = 0x8080ffffu;
     MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
     [m_whiteTex replaceRegion:region mipmapLevel:0 withBytes:&pixel bytesPerRow:4];
+    [m_blackTex replaceRegion:region mipmapLevel:0 withBytes:&blackPixel bytesPerRow:4];
+    [m_flatNormalTex replaceRegion:region mipmapLevel:0 withBytes:&flatNormalPixel bytesPerRow:4];
 }
 
 static simd::float4x4 PerspectiveRH(float fovyRadians, float aspect, float zn, float zf)
@@ -512,58 +514,6 @@ static simd::float4x4 RotationY(float a)
     m.columns[0] = { c, 0, -s, 0 };
     m.columns[2] = { s, 0,  c, 0 };
     return m;
-}
-
-static bool SegmentTriangleIntersection(simd::float3 start,
-                                        simd::float3 end,
-                                        simd::float3 a,
-                                        simd::float3 b,
-                                        simd::float3 c,
-                                        float& outT,
-                                        simd::float3& outPoint,
-                                        simd::float3& outNormal)
-{
-    const simd::float3 dir = end - start;
-    const simd::float3 edge1 = b - a;
-    const simd::float3 edge2 = c - a;
-    const simd::float3 p = simd::cross(dir, edge2);
-    const float det = simd::dot(edge1, p);
-    if (fabsf(det) < 1e-6f)
-    {
-        return false;
-    }
-
-    const float invDet = 1.0f / det;
-    const simd::float3 tVec = start - a;
-    const float u = simd::dot(tVec, p) * invDet;
-    if (u < 0.0f || u > 1.0f)
-    {
-        return false;
-    }
-
-    const simd::float3 q = simd::cross(tVec, edge1);
-    const float v = simd::dot(dir, q) * invDet;
-    if (v < 0.0f || (u + v) > 1.0f)
-    {
-        return false;
-    }
-
-    const float t = simd::dot(edge2, q) * invDet;
-    if (t < 0.0f || t > 1.0f)
-    {
-        return false;
-    }
-
-    const simd::float3 normal = simd::cross(edge1, edge2);
-    if (simd::length_squared(normal) < 1e-8f)
-    {
-        return false;
-    }
-
-    outT = t;
-    outPoint = start + dir * t;
-    outNormal = simd::normalize(normal);
-    return true;
 }
 
 void MetalRenderer::DrawFrame()
@@ -630,83 +580,13 @@ void MetalRenderer::DrawFrame()
         simd::float3 frontXZ = simd::float3{ sinf(m_yaw), 0.0f, -cosf(m_yaw) };
         simd::float3 right   = simd::float3{ cosf(m_yaw), 0.0f, sinf(m_yaw) };
 
-        //W=13, S=1, A=0, D=2, E=14, Space=49, Shift=56/60
+        //W=13, S=1, A=0, D=2, Space=49, Shift=56/60
         if (inp.KeyHeld(13))  m_camPos += frontXZ * (m_camSpeed * dt);  // W
         if (inp.KeyHeld(1))   m_camPos -= frontXZ * (m_camSpeed * dt); // S
         if (inp.KeyHeld(0))   m_camPos -= right * (m_camSpeed * dt);   // A
         if (inp.KeyHeld(2))   m_camPos += right * (m_camSpeed * dt);   // D
         if (inp.KeyHeld(49))  m_camPos.y += m_camSpeed * dt;           // Space
         if (inp.ModifierShift()) m_camPos.y -= m_camSpeed * dt;        // Shift — вниз
-
-        if (inp.KeyPressed(14))
-        {
-            m_thrownLightActive = true;
-            m_thrownLightLanded = false;
-            m_thrownLightForward = front;
-            m_thrownLightPos = m_camPos + front * m_thrownLightSpawnOffset;
-            m_thrownLightVelocity = front * m_thrownLightLaunchSpeed;
-            m_thrownLightVelocity.y -= m_thrownLightInitialDropSpeed;
-        }
-
-        if (m_thrownLightActive && !m_thrownLightLanded)
-        {
-            const simd::float3 previousPos = m_thrownLightPos;
-            m_thrownLightVelocity.y -= m_thrownLightGravity * dt;
-            m_thrownLightPos += m_thrownLightVelocity * dt;
-
-            bool hitSurface = false;
-            float closestT = 1.0f;
-            simd::float3 hitPoint = m_thrownLightPos;
-            simd::float3 hitNormal = simd::float3{0.0f, 1.0f, 0.0f};
-            const simd::float3 sweepMin = Min3(previousPos, m_thrownLightPos, previousPos);
-            const simd::float3 sweepMax = Max3(previousPos, m_thrownLightPos, previousPos);
-
-            for (const CollisionTriangle& tri : m_collisionTriangles)
-            {
-                if (tri.aabbMax.x < sweepMin.x || tri.aabbMin.x > sweepMax.x ||
-                    tri.aabbMax.y < sweepMin.y || tri.aabbMin.y > sweepMax.y ||
-                    tri.aabbMax.z < sweepMin.z || tri.aabbMin.z > sweepMax.z)
-                {
-                    continue;
-                }
-
-                float t = 0.0f;
-                simd::float3 candidatePoint;
-                simd::float3 candidateNormal;
-                if (!SegmentTriangleIntersection(previousPos, m_thrownLightPos,
-                                                 tri.a, tri.b, tri.c,
-                                                 t, candidatePoint, candidateNormal))
-                {
-                    continue;
-                }
-
-                if (!hitSurface || t < closestT)
-                {
-                    hitSurface = true;
-                    closestT = t;
-                    hitPoint = candidatePoint;
-                    hitNormal = candidateNormal;
-                }
-            }
-
-            if (hitSurface)
-            {
-                m_thrownLightPos = hitPoint + hitNormal * m_thrownLightSurfaceOffset;
-                m_thrownLightVelocity = simd::float3{0.0f, 0.0f, 0.0f};
-                m_thrownLightLanded = true;
-            }
-            else if (m_thrownLightPos.y <= m_meshAabbMin.y)
-            {
-                m_thrownLightPos.y = m_meshAabbMin.y;
-                m_thrownLightVelocity = simd::float3{0.0f, 0.0f, 0.0f};
-                m_thrownLightLanded = true;
-            }
-        }
-
-        m_pointLight = PointLight(m_thrownLightPos,
-                                  m_pointLight.GetRange(),
-                                  m_pointLight.GetColor(),
-                                  m_pointLight.GetIntensity());
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -728,17 +608,18 @@ void MetalRenderer::DrawFrame()
         cb->lightDir = m_directionalLight.GetDirection();
         cb->lightIntensity = m_directionalLight.GetIntensity();
         cb->lightColor = m_directionalLight.GetColor();
-        
-        cb->pointLightPos = m_pointLight.GetPosition();
-        cb->pointLightRange = m_pointLight.GetRange();
-        cb->pointLightColor = m_pointLight.GetColor();
-        cb->pointLightIntensity = m_pointLight.GetIntensity();
-        cb->spotLightPos = m_spotLight.GetPosition();
-        cb->spotLightRange = m_spotLight.GetRange();
-        cb->spotLightDir = m_spotLight.GetDirection();
-        cb->spotLightConeAngle = m_spotLight.GetConeAngleRadians();
-        cb->spotLightColor = m_spotLight.GetColor();
-        cb->spotLightIntensity = m_spotLight.GetIntensity();
+
+        const float cameraToMeshDistance = simd::distance(m_camPos, m_meshCenter);
+        const float tessellationFadeNear =
+            fmaxf(m_meshRadius * m_tessellationFadeNearMultiplier, 0.0f);
+        const float tessellationFadeFar =
+            fmaxf(tessellationFadeNear + 0.001f, m_meshRadius * m_tessellationFadeFarMultiplier);
+        float tessellationFactor =
+            1.0f - ((cameraToMeshDistance - tessellationFadeNear) /
+                    (tessellationFadeFar - tessellationFadeNear));
+        tessellationFactor = fmaxf(0.0f, fminf(tessellationFactor, 1.0f));
+        const float displacementStrength =
+            m_meshRadius * m_tessellationStrength * tessellationFactor;
 
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
@@ -752,6 +633,7 @@ void MetalRenderer::DrawFrame()
 
         [enc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
         [enc setFragmentSamplerState:m_sampler atIndex:0];
+        [enc setVertexSamplerState:m_sampler atIndex:0];
 
         for (const DrawBatch& b : m_batches)
         {
@@ -760,14 +642,28 @@ void MetalRenderer::DrawFrame()
             {
                 mat = m_materials[b.materialIndex];
             }
+            mat.detailParams.x = displacementStrength;
+            [enc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
             [enc setFragmentBytes:&mat length:sizeof(MaterialGPU) atIndex:1];
 
-            id<MTLTexture> tex = m_whiteTex;
-            if (b.materialIndex < m_materialTextures.size() && m_materialTextures[b.materialIndex])
+            id<MTLTexture> diffuseTex = m_whiteTex;
+            if (b.materialIndex < m_diffuseTextures.size() && m_diffuseTextures[b.materialIndex])
             {
-                tex = m_materialTextures[b.materialIndex];
+                diffuseTex = m_diffuseTextures[b.materialIndex];
             }
-            [enc setFragmentTexture:tex atIndex:0];
+            id<MTLTexture> normalTex = m_flatNormalTex;
+            if (b.materialIndex < m_normalTextures.size() && m_normalTextures[b.materialIndex])
+            {
+                normalTex = m_normalTextures[b.materialIndex];
+            }
+            id<MTLTexture> heightTex = m_blackTex;
+            if (b.materialIndex < m_heightTextures.size() && m_heightTextures[b.materialIndex])
+            {
+                heightTex = m_heightTextures[b.materialIndex];
+            }
+            [enc setVertexTexture:heightTex atIndex:0];
+            [enc setFragmentTexture:diffuseTex atIndex:0];
+            [enc setFragmentTexture:normalTex atIndex:1];
 
             [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                             indexCount:b.indexCount

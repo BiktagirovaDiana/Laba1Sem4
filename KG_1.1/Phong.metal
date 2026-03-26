@@ -26,16 +26,6 @@ struct CameraCB
     float    pad0;
     float3   cameraPos;
     float    timeSeconds;
-    float3   pointLightPos;
-    float    pointLightRange;
-    float3   pointLightColor;
-    float    pointLightIntensity;
-    float3   spotLightPos;
-    float    spotLightRange;
-    float3   spotLightDir;
-    float    spotLightConeAngle;
-    float3   spotLightColor;
-    float    spotLightIntensity;
 };
 
 struct MaterialCB
@@ -44,8 +34,8 @@ struct MaterialCB
     float4 ks_alpha;
     float2 uvScale;
     float2 uvSpeed;
-    uint useTexture;
-    float3 pad;
+    uint4 textureFlags;
+    float4 detailParams;
 };
 
 struct VSOut
@@ -64,17 +54,57 @@ struct GBufferOut
     float4 material [[color(3)]];
 };
 
+static float3x3 CotangentFrame(float3 N, float3 worldPos, float2 uv)
+{
+    const float3 dp1 = dfdx(worldPos);
+    const float3 dp2 = dfdy(worldPos);
+    const float2 duv1 = dfdx(uv);
+    const float2 duv2 = dfdy(uv);
+
+    const float3 dp2perp = cross(dp2, N);
+    const float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    const float invMax = rsqrt(max(dot(T, T), dot(B, B)));
+    return float3x3(T * invMax, B * invMax, N);
+}
+
+static float3 ApplyNormalMap(float3 baseNormal,
+                             float3 worldPos,
+                             float2 uv,
+                             float3 normalSample,
+                             float normalStrength)
+{
+    const float3 tangentNormal = normalize(float3(normalSample.xy * 2.0 - 1.0,
+                                                  max(normalSample.z * 2.0 - 1.0, 0.0)));
+    const float3 blendedTangentNormal =
+        normalize(float3(tangentNormal.xy * normalStrength, tangentNormal.z));
+    const float3x3 tbn = CotangentFrame(baseNormal, worldPos, uv);
+    return normalize(tbn * blendedTangentNormal);
+}
+
 vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
-                        constant CameraCB& cb [[buffer(1)]])
+                        constant CameraCB& cb [[buffer(1)]],
+                        constant MaterialCB& mat [[buffer(2)]],
+                        texture2d<float> heightTex [[texture(0)]],
+                        sampler linearSampler [[sampler(0)]])
 {
     VSOut o;
-    float4 wp = cb.world * float4(vin.position, 1.0);
+    const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
+    float3 displacedPosition = vin.position;
+    if (mat.textureFlags.z != 0u)
+    {
+        const float height = heightTex.sample(linearSampler, uv, level(0.0)).r;
+        displacedPosition.y += height * mat.detailParams.x;
+    }
+
+    float4 wp = cb.world * float4(displacedPosition, 1.0);
     float4 vp = cb.view  * wp;
     o.position = cb.proj * vp;
 
     o.worldPos = wp.xyz;
     o.worldN = normalize((cb.world * float4(vin.normal, 0.0)).xyz);
-    o.uv = vin.uv;
+    o.uv = uv;
     return o;
 }
 
@@ -82,19 +112,25 @@ fragment GBufferOut ps_gbuffer(VSOut in [[stage_in]],
                                constant CameraCB& cb [[buffer(0)]],
                                constant MaterialCB& mat [[buffer(1)]],
                                texture2d<float> diffuseTex [[texture(0)]],
+                               texture2d<float> normalTex [[texture(1)]],
                                sampler linearSampler [[sampler(0)]])
 {
-    float2 uv = in.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
-
     float3 baseColor = mat.kd_ns.rgb;
-    if (mat.useTexture != 0)
+    if (mat.textureFlags.x != 0u)
     {
-        baseColor *= diffuseTex.sample(linearSampler, uv).rgb;
+        baseColor *= diffuseTex.sample(linearSampler, in.uv).rgb;
+    }
+
+    float3 worldNormal = normalize(in.worldN);
+    if (mat.textureFlags.y != 0u)
+    {
+        const float3 normalSample = normalTex.sample(linearSampler, in.uv).rgb;
+        worldNormal = ApplyNormalMap(worldNormal, in.worldPos, in.uv, normalSample, mat.detailParams.y);
     }
 
     GBufferOut outData;
     outData.albedo = float4(baseColor, 1.0);
-    outData.normal = float4(normalize(in.worldN), 1.0);
+    outData.normal = float4(worldNormal, 1.0);
     outData.position = float4(in.worldPos, 1.0);
     outData.material = float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
     return outData;
@@ -121,23 +157,6 @@ vertex FullscreenOut vs_fullscreen(uint vid [[vertex_id]])
     o.uv = pos[vid] * 0.5 + 0.5;
     o.uv.y = 1.0 - o.uv.y;
     return o;
-}
-
-static float LightMarkerMask(float3 worldPosition,
-                             constant CameraCB& cb,
-                             float2 uv,
-                             float radius)
-{
-    const float4 clipPos = cb.proj * (cb.view * float4(worldPosition, 1.0));
-    if (clipPos.w <= 0.0001)
-    {
-        return 0.0;
-    }
-
-    const float2 ndc = clipPos.xy / clipPos.w;
-    const float2 markerUv = float2(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
-    const float dist = distance(uv, markerUv);
-    return 1.0 - smoothstep(radius * 0.65, radius, dist);
 }
 
 fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
@@ -175,48 +194,6 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
         albedoSample.rgb * ambient +
         albedoSample.rgb * diff * directionalRadiance +
         materialSample.rgb * spec * directionalRadiance;
-
-    const float3 toPointLight = cb.pointLightPos - worldPos;
-    const float pointDistance = length(toPointLight);
-    if (pointDistance < cb.pointLightRange)
-    {
-        const float3 pointL = toPointLight / max(pointDistance, 0.0001);
-        const float pointAttenuation = pow(saturate(1.0 - pointDistance / cb.pointLightRange), 2.0);
-        const float pointDiffuse = max(dot(N, pointL), 0.0);
-        const float3 pointR = reflect(-pointL, N);
-        const float pointSpecular = pow(max(dot(pointR, V), 0.0), materialSample.a);
-        const float3 pointRadiance = cb.pointLightColor * cb.pointLightIntensity * pointAttenuation;
-
-        color += albedoSample.rgb * pointDiffuse * pointRadiance;
-        color += materialSample.rgb * pointSpecular * pointRadiance;
-    }
-
-    const float3 toSpotLight = cb.spotLightPos - worldPos;
-    const float spotDistance = length(toSpotLight);
-    if (spotDistance < cb.spotLightRange)
-    {
-        const float3 spotL = toSpotLight / max(spotDistance, 0.0001);
-        const float coneLimit = cos(cb.spotLightConeAngle);
-        const float coneDot = dot(normalize(-cb.spotLightDir), spotL);
-        if (coneDot > coneLimit)
-        {
-            const float coneAttenuation = saturate((coneDot - coneLimit) / max(1.0 - coneLimit, 0.0001));
-            const float distanceAttenuation = pow(saturate(1.0 - spotDistance / cb.spotLightRange), 2.0);
-            const float spotAttenuation = coneAttenuation * distanceAttenuation;
-            const float spotDiffuse = max(dot(N, spotL), 0.0);
-            const float3 spotR = reflect(-spotL, N);
-            const float spotSpecular = pow(max(dot(spotR, V), 0.0), materialSample.a);
-            const float3 spotRadiance = cb.spotLightColor * cb.spotLightIntensity * spotAttenuation;
-
-            color += albedoSample.rgb * spotDiffuse * spotRadiance;
-            color += materialSample.rgb * spotSpecular * spotRadiance;
-        }
-    }
-
-    const float pointMarker = LightMarkerMask(cb.pointLightPos, cb, uv, 0.022);
-    const float spotMarker = LightMarkerMask(cb.spotLightPos, cb, uv, 0.024);
-    color = mix(color, float3(0.2, 1.0, 0.2), pointMarker);
-    color = mix(color, float3(1.0, 0.1, 0.1), spotMarker);
 
     return float4(color, 1.0);
 }
