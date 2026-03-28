@@ -1,0 +1,14 @@
+newmtl New_Graph
+Ka 1.000000 1.000000 1.000000
+Kd 1.000000 1.000000 1.000000
+Ks 0.040000 0.040000 0.040000
+Ns 16.000000
+d 1.000000
+illum 2
+
+map_Ka New_Graph_basecolor.jpg
+map_Kd New_Graph_basecolor.jpg
+map_Bump New_Graph_height.jpg
+bump New_Graph_height.jpg
+norm New_Graph_normal.jpg
+map_Pr New_Graph_roughness.jpg

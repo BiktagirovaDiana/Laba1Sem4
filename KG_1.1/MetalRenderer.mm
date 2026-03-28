@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cmath>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,13 @@ static inline simd_float4x4 MatPerspectiveRH(float fovyRadians, float aspect, fl
     return m;
 }
 
+static inline simd_float4x4 MatTranslation(simd_float3 t)
+{
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[3] = (simd_float4){ t.x, t.y, t.z, 1.0f };
+    return m;
+}
+
 static bool FileExists(const char* p)
 {
     struct stat st;
@@ -104,25 +112,10 @@ static std::string JoinPath(const std::string& a, const std::string& b)
     return a + "/" + b;
 }
 
-static simd::float3 Min3(simd::float3 a, simd::float3 b, simd::float3 c)
-{
-    return simd::float3{fminf(a.x, fminf(b.x, c.x)),
-                        fminf(a.y, fminf(b.y, c.y)),
-                        fminf(a.z, fminf(b.z, c.z))};
-}
-
-static simd::float3 Max3(simd::float3 a, simd::float3 b, simd::float3 c)
-{
-    return simd::float3{fmaxf(a.x, fmaxf(b.x, c.x)),
-                        fmaxf(a.y, fmaxf(b.y, c.y)),
-                        fmaxf(a.z, fmaxf(b.z, c.z))};
-}
-
-static std::string ResolveAssetPath(const std::string& fileName)
+static std::vector<std::string> GetAssetCandidateDirs()
 {
     std::vector<std::string> candidateDirs;
 
-    // Prefer assets located next to the checked-in source tree over stale build artifacts.
     const std::string sourceDir = DirName(__FILE__);
     if (!sourceDir.empty())
     {
@@ -144,7 +137,125 @@ static std::string ResolveAssetPath(const std::string& fileName)
         }
     }
 
-    for (const std::string& d : candidateDirs)
+    return candidateDirs;
+}
+
+static bool ParseModelAssetName(const std::string& fileName, int& sortIndex)
+{
+    constexpr const char* kPrefix = "model";
+    constexpr const char* kSuffix = ".obj";
+    if (fileName.size() < 9 || fileName.rfind(kSuffix) != fileName.size() - 4)
+    {
+        return false;
+    }
+    if (fileName.compare(0, 5, kPrefix) != 0)
+    {
+        return false;
+    }
+
+    const std::string middle = fileName.substr(5, fileName.size() - 9);
+    if (middle.empty())
+    {
+        sortIndex = 1;
+        return true;
+    }
+
+    for (char ch : middle)
+    {
+        if (!std::isdigit(static_cast<unsigned char>(ch)))
+        {
+            return false;
+        }
+    }
+
+    sortIndex = std::max(2, std::stoi(middle));
+    return true;
+}
+
+static std::vector<std::string> ResolveModelAssetPaths()
+{
+    std::vector<std::string> modelPaths;
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+
+    for (const std::string& dir : GetAssetCandidateDirs())
+    {
+        if (!DirExists(dir.c_str()))
+        {
+            continue;
+        }
+
+        NSString* nsDir = [NSString stringWithUTF8String:dir.c_str()];
+        NSError* err = nil;
+        NSArray<NSString*>* contents = [fileManager contentsOfDirectoryAtPath:nsDir error:&err];
+        if (!contents)
+        {
+            NSLog(@"Failed to enumerate assets in %@: %@", nsDir, err);
+            continue;
+        }
+
+        std::vector<std::pair<int, std::string>> foundModels;
+        foundModels.reserve(contents.count);
+        for (NSString* entry in contents)
+        {
+            const std::string fileName = [entry UTF8String];
+            int sortIndex = 0;
+            if (!ParseModelAssetName(fileName, sortIndex))
+            {
+                continue;
+            }
+
+            const std::string fullPath = JoinPath(dir, fileName);
+            if (!FileExists(fullPath.c_str()))
+            {
+                continue;
+            }
+
+            foundModels.push_back({sortIndex, fullPath});
+        }
+
+        if (foundModels.empty())
+        {
+            continue;
+        }
+
+        std::sort(foundModels.begin(), foundModels.end(),
+                  [](const auto& lhs, const auto& rhs)
+                  {
+                      if (lhs.first != rhs.first)
+                      {
+                          return lhs.first < rhs.first;
+                      }
+                      return lhs.second < rhs.second;
+                  });
+
+        modelPaths.reserve(foundModels.size());
+        for (const auto& entry : foundModels)
+        {
+            modelPaths.push_back(entry.second);
+        }
+        return modelPaths;
+    }
+
+    return modelPaths;
+}
+
+static simd::float3 Min3(simd::float3 a, simd::float3 b, simd::float3 c)
+{
+    return simd::float3{fminf(a.x, fminf(b.x, c.x)),
+                        fminf(a.y, fminf(b.y, c.y)),
+                        fminf(a.z, fminf(b.z, c.z))};
+}
+
+static simd::float3 Max3(simd::float3 a, simd::float3 b, simd::float3 c)
+{
+    return simd::float3{fmaxf(a.x, fmaxf(b.x, c.x)),
+                        fmaxf(a.y, fmaxf(b.y, c.y)),
+                        fmaxf(a.z, fmaxf(b.z, c.z))};
+}
+
+static std::string ResolveAssetPath(const std::string& fileName)
+{
+    for (const std::string& d : GetAssetCandidateDirs())
     {
         const std::string full = JoinPath(d, fileName);
         if (FileExists(full.c_str()))
@@ -190,6 +301,26 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
 }
  
 MetalRenderer::~MetalRenderer() {}
+
+float MetalRenderer::GetTessellationStrengthForModel(uint32_t modelIndex) const
+{
+    if (modelIndex < m_modelTessellationStrengths.size())
+    {
+        return m_modelTessellationStrengths[modelIndex];
+    }
+
+    return m_tessellationStrength;
+}
+
+simd::float3 MetalRenderer::GetOffsetForModel(uint32_t modelIndex) const
+{
+    if (modelIndex < m_modelOffsets.size())
+    {
+        return m_modelOffsets[modelIndex];
+    }
+
+    return simd::float3{0.0f, 0.0f, 0.0f};
+}
 
 void MetalRenderer::CreateDeviceAndSwapchain()
 {
@@ -274,80 +405,172 @@ void MetalRenderer::CreateConstantBuffer()
 
 void MetalRenderer::LoadObjMesh()
 {
-    ObjMesh mesh;
-
     char cwd[2048];
     getcwd(cwd, sizeof(cwd));
     NSLog(@"CWD = %s", cwd);
 
-    const std::string objPath = ResolveAssetPath("model.obj");
-    if (objPath.empty())
+    const std::vector<std::string> objPaths = ResolveModelAssetPaths();
+    if (objPaths.empty())
     {
-        NSLog(@"OBJ not found. Tried: assets/model.obj, KG_1.1/assets/model.obj, executable-relative paths");
+        NSLog(@"No model OBJ files found. Expected names like model.obj, model2.obj, model3.obj in assets.");
         m_indexCount = 0;
         return;
     }
 
-    const std::string assetsDir = DirName(objPath);
-    NSLog(@"Loading OBJ from: %s", objPath.c_str());
-
-    const bool ok = ObjLoader::LoadMesh(objPath, mesh);
-    
-    if (!ok || mesh.vertices.empty() || mesh.indices.empty())
-    {
-        NSLog(@"OBJ load failed OR empty mesh. vertices=%lu indices=%lu",
-              (unsigned long)mesh.vertices.size(), (unsigned long)mesh.indices.size());
-        m_indexCount = 0;
-        return;
-    }
-
-    m_indexCount = (uint32_t)mesh.indices.size();
-    m_cpuVertices = mesh.vertices;
-    m_cpuIndices = mesh.indices;
+    m_indexCount = 0;
+    m_cpuVertices.clear();
+    m_cpuIndices.clear();
     m_collisionTriangles.clear();
-    m_collisionTriangles.reserve(mesh.indices.size() / 3);
 
-    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
+    // Keep the original fixed camera start.
+    m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
+    m_camSpeed = 120.0f;
+    m_yaw = (float)M_PI;
+    m_pitch = 0.0f;
+
+    m_batches.clear();
+    m_materials.clear();
+    m_diffuseTextures.clear();
+    m_normalTextures.clear();
+    m_heightTextures.clear();
+    bool haveBounds = false;
+
+    for (size_t modelIndex = 0; modelIndex < objPaths.size(); ++modelIndex)
     {
-        const VertexPNT& va = mesh.vertices[mesh.indices[i + 0]];
-        const VertexPNT& vb = mesh.vertices[mesh.indices[i + 1]];
-        const VertexPNT& vc = mesh.vertices[mesh.indices[i + 2]];
-        const simd::float3 a = simd::float3{va.px, va.py, va.pz};
-        const simd::float3 b = simd::float3{vb.px, vb.py, vb.pz};
-        const simd::float3 c = simd::float3{vc.px, vc.py, vc.pz};
-        const simd::float3 normal = simd::cross(b - a, c - a);
-        if (simd::length_squared(normal) < 1e-8f)
+        const std::string& objPath = objPaths[modelIndex];
+        ObjMesh mesh;
+        NSLog(@"Loading OBJ from: %s", objPath.c_str());
+
+        const bool ok = ObjLoader::LoadMesh(objPath, mesh);
+        if (!ok || mesh.vertices.empty() || mesh.indices.empty())
         {
+            NSLog(@"OBJ load failed OR empty mesh. path=%s vertices=%lu indices=%lu",
+                  objPath.c_str(),
+                  (unsigned long)mesh.vertices.size(),
+                  (unsigned long)mesh.indices.size());
             continue;
         }
 
-        CollisionTriangle tri;
-        tri.a = a;
-        tri.b = b;
-        tri.c = c;
-        tri.normal = simd::normalize(normal);
-        if (tri.normal.y <= 0.15f)
+        const uint32_t vertexBase = (uint32_t)m_cpuVertices.size();
+        const uint32_t indexBase = (uint32_t)m_cpuIndices.size();
+        const uint32_t materialBase = (uint32_t)m_materials.size();
+
+        if (!haveBounds)
         {
-            continue;
+            m_meshAabbMin = simd::float3{mesh.vertices[0].px, mesh.vertices[0].py, mesh.vertices[0].pz};
+            m_meshAabbMax = m_meshAabbMin;
+            haveBounds = true;
         }
 
-        tri.aabbMin = Min3(a, b, c);
-        tri.aabbMax = Max3(a, b, c);
-        m_collisionTriangles.push_back(tri);
+        for (const VertexPNT& v : mesh.vertices)
+        {
+            m_cpuVertices.push_back(v);
+            if (v.px < m_meshAabbMin.x) m_meshAabbMin.x = v.px;
+            if (v.py < m_meshAabbMin.y) m_meshAabbMin.y = v.py;
+            if (v.pz < m_meshAabbMin.z) m_meshAabbMin.z = v.pz;
+            if (v.px > m_meshAabbMax.x) m_meshAabbMax.x = v.px;
+            if (v.py > m_meshAabbMax.y) m_meshAabbMax.y = v.py;
+            if (v.pz > m_meshAabbMax.z) m_meshAabbMax.z = v.pz;
+        }
+
+        m_cpuIndices.reserve(m_cpuIndices.size() + mesh.indices.size());
+        for (uint32_t idx : mesh.indices)
+        {
+            m_cpuIndices.push_back(vertexBase + idx);
+        }
+
+        m_collisionTriangles.reserve(m_collisionTriangles.size() + mesh.indices.size() / 3);
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
+        {
+            const VertexPNT& va = mesh.vertices[mesh.indices[i + 0]];
+            const VertexPNT& vb = mesh.vertices[mesh.indices[i + 1]];
+            const VertexPNT& vc = mesh.vertices[mesh.indices[i + 2]];
+            const simd::float3 a = simd::float3{va.px, va.py, va.pz};
+            const simd::float3 b = simd::float3{vb.px, vb.py, vb.pz};
+            const simd::float3 c = simd::float3{vc.px, vc.py, vc.pz};
+            const simd::float3 normal = simd::cross(b - a, c - a);
+            if (simd::length_squared(normal) < 1e-8f)
+            {
+                continue;
+            }
+
+            CollisionTriangle tri;
+            tri.a = a;
+            tri.b = b;
+            tri.c = c;
+            tri.normal = simd::normalize(normal);
+            if (tri.normal.y <= 0.15f)
+            {
+                continue;
+            }
+
+            tri.aabbMin = Min3(a, b, c);
+            tri.aabbMax = Max3(a, b, c);
+            m_collisionTriangles.push_back(tri);
+        }
+
+        m_materials.reserve(m_materials.size() + mesh.materials.size());
+        m_diffuseTextures.reserve(m_diffuseTextures.size() + mesh.materials.size());
+        m_normalTextures.reserve(m_normalTextures.size() + mesh.materials.size());
+        m_heightTextures.reserve(m_heightTextures.size() + mesh.materials.size());
+        for (const ObjMaterial& m : mesh.materials)
+        {
+            MaterialGPU gpuMat;
+            gpuMat.kd_ns = simd::float4{m.kd[0], m.kd[1], m.kd[2], (m.ns > 0.0f) ? m.ns : 32.0f};
+            gpuMat.ks_alpha = simd::float4{m.ks[0], m.ks[1], m.ks[2], m.d};
+            gpuMat.uvScale = m_textureTiling;
+            gpuMat.uvSpeed = m_textureScrollSpeed;
+            gpuMat.detailParams = simd::float4{m_meshRadius * m_tessellationStrength, 1.0f, 0.0f, 0.0f};
+
+            id<MTLTexture> diffuseTex = nil;
+            if (!m.diffuseTexPath.empty())
+            {
+                diffuseTex = LoadTextureOrNil(m.diffuseTexPath, true);
+            }
+            id<MTLTexture> normalTex = nil;
+            if (!m.normalTexPath.empty())
+            {
+                normalTex = LoadTextureOrNil(m.normalTexPath, false);
+            }
+            id<MTLTexture> heightTex = nil;
+            if (!m.heightTexPath.empty())
+            {
+                heightTex = LoadTextureOrNil(m.heightTexPath, false);
+            }
+
+            gpuMat.textureFlags[0] = diffuseTex ? 1u : 0u;
+            gpuMat.textureFlags[1] = normalTex ? 1u : 0u;
+            gpuMat.textureFlags[2] = heightTex ? 1u : 0u;
+
+            NSLog(@"Material '%s': diffuseTex=%s normalTex=%s heightTex=%s",
+                  m.name.empty() ? "<default>" : m.name.c_str(),
+                  m.diffuseTexPath.empty() ? "<none>" : m.diffuseTexPath.c_str(),
+                  m.normalTexPath.empty() ? "<none>" : m.normalTexPath.c_str(),
+                  m.heightTexPath.empty() ? "<none>" : m.heightTexPath.c_str());
+
+            m_materials.push_back(gpuMat);
+            m_diffuseTextures.push_back(diffuseTex);
+            m_normalTextures.push_back(normalTex);
+            m_heightTextures.push_back(heightTex);
+        }
+
+        m_batches.reserve(m_batches.size() + mesh.submeshes.size());
+        for (const ObjSubmesh& sm : mesh.submeshes)
+        {
+            DrawBatch b;
+            b.indexOffset = indexBase + sm.indexOffset;
+            b.indexCount = sm.indexCount;
+            b.materialIndex = materialBase + sm.materialIndex;
+            b.sourceModelIndex = (uint32_t)modelIndex;
+            m_batches.push_back(b);
+        }
     }
 
-    // Bounds in object space are used to make texture animation speed depend on camera distance.
-    
-    m_meshAabbMin = simd::float3{mesh.vertices[0].px, mesh.vertices[0].py, mesh.vertices[0].pz};
-    m_meshAabbMax = m_meshAabbMin;
-    for (const VertexPNT& v : mesh.vertices)
+    m_indexCount = (uint32_t)m_cpuIndices.size();
+    if (m_indexCount == 0 || m_cpuVertices.empty())
     {
-        if (v.px < m_meshAabbMin.x) m_meshAabbMin.x = v.px;
-        if (v.py < m_meshAabbMin.y) m_meshAabbMin.y = v.py;
-        if (v.pz < m_meshAabbMin.z) m_meshAabbMin.z = v.pz;
-        if (v.px > m_meshAabbMax.x) m_meshAabbMax.x = v.px;
-        if (v.py > m_meshAabbMax.y) m_meshAabbMax.y = v.py;
-        if (v.pz > m_meshAabbMax.z) m_meshAabbMax.z = v.pz;
+        NSLog(@"No valid OBJ meshes were loaded.");
+        return;
     }
 
     m_meshCenter = (m_meshAabbMin + m_meshAabbMax) * 0.5f;
@@ -358,80 +581,13 @@ void MetalRenderer::LoadObjMesh()
         m_meshRadius = 1.0f;
     }
 
-    // Keep the original fixed camera start.
-    m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
-    m_camSpeed = 120.0f;
-    m_yaw = (float)M_PI;
-    m_pitch = 0.0f;
-
-    m_vb = [m_device newBufferWithBytes:mesh.vertices.data()
-                                 length:mesh.vertices.size() * sizeof(VertexPNT)
+    m_vb = [m_device newBufferWithBytes:m_cpuVertices.data()
+                                 length:m_cpuVertices.size() * sizeof(VertexPNT)
                                 options:MTLResourceStorageModeShared];
 
-    m_ib = [m_device newBufferWithBytes:mesh.indices.data()
-                                 length:mesh.indices.size() * sizeof(uint32_t)
+    m_ib = [m_device newBufferWithBytes:m_cpuIndices.data()
+                                 length:m_cpuIndices.size() * sizeof(uint32_t)
                                 options:MTLResourceStorageModeShared];
-
-    m_batches.clear();
-    m_materials.clear();
-    m_diffuseTextures.clear();
-    m_normalTextures.clear();
-    m_heightTextures.clear();
-    m_batches.reserve(mesh.submeshes.size());
-    m_materials.reserve(mesh.materials.size());
-    m_diffuseTextures.reserve(mesh.materials.size());
-    m_normalTextures.reserve(mesh.materials.size());
-    m_heightTextures.reserve(mesh.materials.size());
-
-    for (const ObjMaterial& m : mesh.materials)
-    {
-        MaterialGPU gpuMat;
-        gpuMat.kd_ns = simd::float4{m.kd[0], m.kd[1], m.kd[2], (m.ns > 0.0f) ? m.ns : 32.0f};
-        gpuMat.ks_alpha = simd::float4{m.ks[0], m.ks[1], m.ks[2], m.d};
-        gpuMat.uvScale = m_textureTiling;
-        gpuMat.uvSpeed = m_textureScrollSpeed;
-        gpuMat.detailParams = simd::float4{m_meshRadius * m_tessellationStrength, 1.0f, 0.0f, 0.0f};
-
-        id<MTLTexture> diffuseTex = nil;
-        if (!m.diffuseTexPath.empty())
-        {
-            diffuseTex = LoadTextureOrNil(m.diffuseTexPath, true);
-        }
-        id<MTLTexture> normalTex = nil;
-        if (!m.normalTexPath.empty())
-        {
-            normalTex = LoadTextureOrNil(m.normalTexPath, false);
-        }
-        id<MTLTexture> heightTex = nil;
-        if (!m.heightTexPath.empty())
-        {
-            heightTex = LoadTextureOrNil(m.heightTexPath, false);
-        }
-
-        gpuMat.textureFlags[0] = diffuseTex ? 1u : 0u;
-        gpuMat.textureFlags[1] = normalTex ? 1u : 0u;
-        gpuMat.textureFlags[2] = heightTex ? 1u : 0u;
-
-        NSLog(@"Material '%s': diffuseTex=%s normalTex=%s heightTex=%s",
-              m.name.empty() ? "<default>" : m.name.c_str(),
-              m.diffuseTexPath.empty() ? "<none>" : m.diffuseTexPath.c_str(),
-              m.normalTexPath.empty() ? "<none>" : m.normalTexPath.c_str(),
-              m.heightTexPath.empty() ? "<none>" : m.heightTexPath.c_str());
-
-        m_materials.push_back(gpuMat);
-        m_diffuseTextures.push_back(diffuseTex);
-        m_normalTextures.push_back(normalTex);
-        m_heightTextures.push_back(heightTex);
-    }
-
-    for (const ObjSubmesh& sm : mesh.submeshes)
-    {
-        DrawBatch b;
-        b.indexOffset = sm.indexOffset;
-        b.indexCount = sm.indexCount;
-        b.materialIndex = sm.materialIndex;
-        m_batches.push_back(b);
-    }
 }
 
 id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path, bool srgb)
@@ -618,8 +774,6 @@ void MetalRenderer::DrawFrame()
             1.0f - ((cameraToMeshDistance - tessellationFadeNear) /
                     (tessellationFadeFar - tessellationFadeNear));
         tessellationFactor = fmaxf(0.0f, fminf(tessellationFactor, 1.0f));
-        const float displacementStrength =
-            m_meshRadius * m_tessellationStrength * tessellationFactor;
 
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
@@ -629,8 +783,6 @@ void MetalRenderer::DrawFrame()
         [enc setDepthStencilState:m_dss];
 
         [enc setVertexBuffer:m_vb offset:0 atIndex:0];
-        [enc setVertexBuffer:m_cameraCB offset:0 atIndex:1];
-
         [enc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
         [enc setFragmentSamplerState:m_sampler atIndex:0];
         [enc setVertexSamplerState:m_sampler atIndex:0];
@@ -642,7 +794,14 @@ void MetalRenderer::DrawFrame()
             {
                 mat = m_materials[b.materialIndex];
             }
+            const float modelTessellationStrength = GetTessellationStrengthForModel(b.sourceModelIndex);
+            const float displacementStrength =
+                m_meshRadius * modelTessellationStrength * tessellationFactor;
             mat.detailParams.x = displacementStrength;
+
+            CameraCB localCb = *cb;
+            localCb.world = MatTranslation(GetOffsetForModel(b.sourceModelIndex));
+            [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
             [enc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
             [enc setFragmentBytes:&mat length:sizeof(MaterialGPU) atIndex:1];
 

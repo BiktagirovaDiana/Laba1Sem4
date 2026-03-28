@@ -53,6 +53,26 @@ bool IsAbsolutePath(const std::string& path)
     return path.size() > 1 && path[1] == ':';
 }
 
+std::string ToLowerCopy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return (char)std::tolower(ch); });
+    return value;
+}
+
+bool LooksLikeHeightTexture(const std::string& texName)
+{
+    if (texName.empty())
+    {
+        return false;
+    }
+
+    const std::string lower = ToLowerCopy(texName);
+    return lower.find("height") != std::string::npos ||
+           lower.find("disp") != std::string::npos ||
+           lower.find("displacement") != std::string::npos;
+}
+
 std::string ResolveTexturePath(const std::string& baseDir, const std::string& texName)
 {
     if (texName.empty())
@@ -129,7 +149,13 @@ bool ObjLoader::LoadMesh(const std::string& path, ObjMesh& outMesh)
             tm.specular_texname;
         m.diffuseTexPath = ResolveTexturePath(baseDir, primaryColorTex);
         m.normalTexPath = ResolveTexturePath(baseDir, tm.normal_texname);
-        m.heightTexPath = ResolveTexturePath(baseDir, tm.bump_texname);
+
+        std::string displacementTexName = tm.displacement_texname;
+        if (displacementTexName.empty() && LooksLikeHeightTexture(tm.bump_texname))
+        {
+            displacementTexName = tm.bump_texname;
+        }
+        m.heightTexPath = ResolveTexturePath(baseDir, displacementTexName);
 
         outMesh.materials.push_back(m);
     }

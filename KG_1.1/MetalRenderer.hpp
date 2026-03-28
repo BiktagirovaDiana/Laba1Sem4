@@ -19,6 +19,7 @@ private:
         uint32_t indexOffset = 0;
         uint32_t indexCount = 0;
         uint32_t materialIndex = 0;
+        uint32_t sourceModelIndex = 0;
     };
 
     struct MaterialGPU
@@ -85,7 +86,7 @@ private:
     simd::float3 m_meshAabbMax = { 0.5f,  0.5f,  0.5f};
     simd::float3 m_meshCenter = {0.0f, 0.0f, 0.0f};
     float m_meshRadius = 1.0f;
-    float m_tessellationStrength = 0.025;
+    float m_tessellationStrength = 0.0005;
     float m_tessellationFadeNearMultiplier = 1.5f;
     float m_tessellationFadeFarMultiplier = 4.5f;
     DirectionalLight m_directionalLight = DirectionalLight(simd::float3{0.0f, -1.0f, 0.0f},
@@ -95,6 +96,13 @@ private:
     float m_textureNearSpeedMultiplier = 4.0f;
     float m_textureFarSpeedMultiplier = 0.35f;
     float m_textureFarDistance = 8.0f;
+    std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f};
+    std::vector<simd::float3> m_modelOffsets =
+    {
+        simd::float3{0.0f, 0.0f, 0.0f},
+        simd::float3{0.0f, 0.0f, 0.0f},
+        simd::float3{25.0f, 0.0f, 0.0f}
+    };
 
     void CreateDeviceAndSwapchain();
     void CreateDepth();
@@ -103,4 +111,6 @@ private:
     void LoadObjMesh();
     void CreateSamplerAndFallbackTexture();
     id<MTLTexture> LoadTextureOrNil(const std::string& path, bool srgb);
+    float GetTessellationStrengthForModel(uint32_t modelIndex) const;
+    simd::float3 GetOffsetForModel(uint32_t modelIndex) const;
 };

@@ -94,8 +94,10 @@ vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
     float3 displacedPosition = vin.position;
     if (mat.textureFlags.z != 0u)
     {
-        const float height = heightTex.sample(linearSampler, uv, level(0.0)).r;
-        displacedPosition.y += height * mat.detailParams.x;
+        // Treat 0.5 as the neutral height and displace along the surface normal.
+        const float height = heightTex.sample(linearSampler, uv, level(0.0)).r - 0.5;
+        const float3 objectNormal = normalize(vin.normal);
+        displacedPosition += objectNormal * (height * mat.detailParams.x);
     }
 
     float4 wp = cb.world * float4(displacedPosition, 1.0);
