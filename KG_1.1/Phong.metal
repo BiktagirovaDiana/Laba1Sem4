@@ -118,9 +118,22 @@ fragment GBufferOut ps_gbuffer(VSOut in [[stage_in]],
                                sampler linearSampler [[sampler(0)]])
 {
     float3 baseColor = mat.kd_ns.rgb;
+    float alpha = 1.0;
+    const bool isPlaneReplacement = (mat.textureFlags.w != 0u);
     if (mat.textureFlags.x != 0u)
     {
-        baseColor *= diffuseTex.sample(linearSampler, in.uv).rgb;
+        const float4 diffuseSample = diffuseTex.sample(linearSampler, in.uv);
+        baseColor *= diffuseSample.rgb;
+        if (isPlaneReplacement)
+        {
+            alpha = mat.ks_alpha.a * diffuseSample.a;
+
+            // Cut semi-transparent fringe pixels harder to avoid blue halos on the sprite edges.
+            if (alpha < 0.85)
+            {
+                discard_fragment();
+            }
+        }
     }
 
     float3 worldNormal = normalize(in.worldN);
@@ -131,10 +144,12 @@ fragment GBufferOut ps_gbuffer(VSOut in [[stage_in]],
     }
 
     GBufferOut outData;
-    outData.albedo = float4(baseColor, 1.0);
+    outData.albedo = float4(baseColor, alpha);
     outData.normal = float4(worldNormal, 1.0);
     outData.position = float4(in.worldPos, 1.0);
-    outData.material = float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
+    outData.material = isPlaneReplacement
+        ? float4(0.0, 0.0, 0.0, 0.0)
+        : float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
     return outData;
 }
 
@@ -182,6 +197,10 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
     const float3 N = normalize(gbufferNormal.sample(linearSampler, uv).xyz);
     const float3 worldPos = gbufferPosition.sample(linearSampler, uv).xyz;
     const float4 materialSample = gbufferMaterial.sample(linearSampler, uv);
+    if (materialSample.a < 0.5)
+    {
+        return float4(albedoSample.rgb * 1.15, 1.0);
+    }
 
     float3 L = normalize(-cb.lightDir);
     float3 V = normalize(cb.cameraPos - worldPos);

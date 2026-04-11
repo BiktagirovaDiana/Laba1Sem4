@@ -88,6 +88,32 @@ static inline simd_float4x4 MatScale(float s)
     return m;
 }
 
+static inline simd_float4x4 MatBillboardFacingCamera(simd_float3 objectPos, simd_float3 cameraPos)
+{
+    simd_float3 forward = cameraPos - objectPos;
+    if (simd_length_squared(forward) < 1e-6f)
+    {
+        forward = simd_float3{0.0f, 0.0f, 1.0f};
+    }
+    forward = simd_normalize(forward);
+
+    simd_float3 upHint = simd_float3{0.0f, 1.0f, 0.0f};
+    simd_float3 right = simd_cross(upHint, forward);
+    if (simd_length_squared(right) < 1e-6f)
+    {
+        upHint = simd_float3{1.0f, 0.0f, 0.0f};
+        right = simd_cross(upHint, forward);
+    }
+    right = simd_normalize(right);
+    const simd_float3 up = simd_normalize(simd_cross(forward, right));
+
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[0] = simd_float4{right.x, right.y, right.z, 0.0f};
+    m.columns[1] = simd_float4{up.x, up.y, up.z, 0.0f};
+    m.columns[2] = simd_float4{forward.x, forward.y, forward.z, 0.0f};
+    return m;
+}
+
 static bool IsSphereVisibleInFrustum(const simd::float4x4& viewMatrix,
                                      simd::float3 worldCenter,
                                      float radius,
@@ -327,6 +353,35 @@ static std::string ResolveAssetPath(const std::string& fileName)
     return std::string();
 }
 
+static ObjMesh CreateTexturedPlaneMesh(const std::string& diffuseTexturePath)
+{
+    ObjMesh mesh;
+    mesh.vertices =
+    {
+        VertexPNT{-0.5f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        VertexPNT{ 0.5f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        VertexPNT{ 0.5f,  0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+        VertexPNT{-0.5f,  0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}
+    };
+    mesh.indices = {0u, 1u, 2u, 0u, 2u, 3u};
+
+    ObjMaterial material;
+    material.name = "model4_plane";
+    material.kd[0] = 1.0f;
+    material.kd[1] = 1.0f;
+    material.kd[2] = 1.0f;
+    material.d = 1.0f;
+    material.diffuseTexPath = diffuseTexturePath;
+    mesh.materials.push_back(material);
+
+    ObjSubmesh submesh;
+    submesh.indexOffset = 0;
+    submesh.indexCount = (uint32_t)mesh.indices.size();
+    submesh.materialIndex = 0;
+    mesh.submeshes.push_back(submesh);
+    return mesh;
+}
+
 
 struct CameraCB
 {
@@ -354,6 +409,11 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateShadersAndPSO();
     CreateConstantBuffer();
     CreateSamplerAndFallbackTexture();
+    CreateModel4PlaneResources();
+    m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
+    m_camSpeed = 120.0f;
+    m_yaw = (float)M_PI;
+    m_pitch = 0.0f;
     LoadObjMesh();
     m_directionalLight = DirectionalLight(simd::float3{-0.3f, -1.0f, -0.2f},
                                           simd::float3{1.0f, 1.0f, 1.0f},
@@ -574,17 +634,12 @@ void MetalRenderer::LoadObjMesh()
     m_bvhInstanceIndices.clear();
     m_visibleInstances.clear();
 
-    // Keep the original fixed camera start.
-    m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
-    m_camSpeed = 120.0f;
-    m_yaw = (float)M_PI;
-    m_pitch = 0.0f;
-
     m_batches.clear();
     m_materials.clear();
     m_diffuseTextures.clear();
     m_normalTextures.clear();
     m_heightTextures.clear();
+    m_model4PlaneStates.clear();
     bool haveBounds = false;
 
     for (size_t modelIndex = 0; modelIndex < objPaths.size(); ++modelIndex)
@@ -592,8 +647,8 @@ void MetalRenderer::LoadObjMesh()
         const std::string& objPath = objPaths[modelIndex];
         ObjMesh mesh;
         NSLog(@"Loading OBJ from: %s", objPath.c_str());
-
         const bool ok = ObjLoader::LoadMesh(objPath, mesh);
+
         if (!ok || mesh.vertices.empty() || mesh.indices.empty())
         {
             NSLog(@"OBJ load failed OR empty mesh. path=%s vertices=%lu indices=%lu",
@@ -702,6 +757,7 @@ void MetalRenderer::LoadObjMesh()
             gpuMat.textureFlags[0] = diffuseTex ? 1u : 0u;
             gpuMat.textureFlags[1] = normalTex ? 1u : 0u;
             gpuMat.textureFlags[2] = heightTex ? 1u : 0u;
+            gpuMat.textureFlags[3] = 0u;
 
             NSLog(@"Material '%s': diffuseTex=%s normalTex=%s heightTex=%s",
                   m.name.empty() ? "<default>" : m.name.c_str(),
@@ -758,6 +814,7 @@ void MetalRenderer::LoadObjMesh()
             instance.worldRadius = modelBounds.localRadius * instance.scale;
             const uint32_t sceneInstanceIndex = (uint32_t)m_sceneInstances.size();
             m_sceneInstances.push_back(instance);
+            m_model4PlaneStates.push_back(0u);
 
             for (const ObjSubmesh& sm : mesh.submeshes)
             {
@@ -796,6 +853,34 @@ void MetalRenderer::LoadObjMesh()
     m_ib = [m_device newBufferWithBytes:m_cpuIndices.data()
                                  length:m_cpuIndices.size() * sizeof(uint32_t)
                                 options:MTLResourceStorageModeShared];
+}
+
+void MetalRenderer::CreateModel4PlaneResources()
+{
+    const std::string model4TexturePath = ResolveAssetPath("model4.png");
+    ObjMesh planeMesh = CreateTexturedPlaneMesh(model4TexturePath);
+    m_model4PlaneIndexCount = (uint32_t)planeMesh.indices.size();
+    if (!planeMesh.vertices.empty())
+    {
+        m_model4PlaneVB = [m_device newBufferWithBytes:planeMesh.vertices.data()
+                                                length:planeMesh.vertices.size() * sizeof(VertexPNT)
+                                               options:MTLResourceStorageModeShared];
+    }
+    if (!planeMesh.indices.empty())
+    {
+        m_model4PlaneIB = [m_device newBufferWithBytes:planeMesh.indices.data()
+                                                length:planeMesh.indices.size() * sizeof(uint32_t)
+                                               options:MTLResourceStorageModeShared];
+    }
+
+    m_model4PlaneMaterial = {};
+    m_model4PlaneMaterial.kd_ns = simd::float4{1.0f, 1.0f, 1.0f, 32.0f};
+    m_model4PlaneMaterial.ks_alpha = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_model4PlaneMaterial.uvScale = simd::float2{1.0f, 1.0f};
+    m_model4PlaneMaterial.uvSpeed = simd::float2{0.0f, 0.0f};
+    m_model4PlaneMaterial.textureFlags = simd::uint4{1u, 0u, 0u, 1u};
+    m_model4PlaneMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+    m_model4PlaneTexture = model4TexturePath.empty() ? nil : LoadTextureOrNil(model4TexturePath, true);
 }
 
 id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path, bool srgb)
@@ -967,6 +1052,32 @@ void MetalRenderer::DrawFrame()
         cb->cameraPos = m_camPos;
         m_timeSeconds += dt;
 
+        const float enterPlaneDistance = m_model4PlaneSwapDistance;
+        const float exitPlaneDistance = m_model4PlaneSwapDistance - m_model4PlaneSwapHysteresis;
+        for (uint32_t instanceIndex = 0; instanceIndex < m_sceneInstances.size(); ++instanceIndex)
+        {
+            const SceneInstance& instance = m_sceneInstances[instanceIndex];
+            if (instance.sourceModelIndex != 3u)
+            {
+                continue;
+            }
+
+            const float distance = simd::distance(m_camPos, instance.worldCenter);
+            if (instanceIndex >= m_model4PlaneStates.size())
+            {
+                continue;
+            }
+
+            if (!m_model4PlaneStates[instanceIndex] && distance > enterPlaneDistance)
+            {
+                m_model4PlaneStates[instanceIndex] = 1u;
+            }
+            else if (m_model4PlaneStates[instanceIndex] && distance < exitPlaneDistance)
+            {
+                m_model4PlaneStates[instanceIndex] = 0u;
+            }
+        }
+
         // Texture animation is disabled for now: keep UV scroll time fixed at zero.
         cb->timeSeconds = 0.0f;
 
@@ -1096,6 +1207,14 @@ void MetalRenderer::DrawFrame()
             }
 
             const SceneInstance& instance = m_sceneInstances[b.instanceIndex];
+            const bool usePlaneForInstance =
+                instance.sourceModelIndex == 3u &&
+                b.instanceIndex < m_model4PlaneStates.size() &&
+                m_model4PlaneStates[b.instanceIndex] != 0u;
+            if (usePlaneForInstance)
+            {
+                continue;
+            }
             MaterialGPU mat{};
             if (b.materialIndex < m_materials.size())
             {
@@ -1136,6 +1255,48 @@ void MetalRenderer::DrawFrame()
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:m_ib
                      indexBufferOffset:(NSUInteger)b.indexOffset * sizeof(uint32_t)];
+        }
+
+        if (m_model4PlaneVB && m_model4PlaneIB && m_model4PlaneIndexCount > 0u)
+        {
+            [enc setVertexBuffer:m_model4PlaneVB offset:0 atIndex:0];
+            [enc setVertexTexture:m_blackTex atIndex:0];
+            [enc setFragmentTexture:(m_model4PlaneTexture ? m_model4PlaneTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentTexture:m_flatNormalTex atIndex:1];
+
+            for (uint32_t instanceIndex = 0; instanceIndex < m_sceneInstances.size(); ++instanceIndex)
+            {
+                if (instanceIndex >= m_visibleInstances.size() || m_visibleInstances[instanceIndex] == 0u)
+                {
+                    continue;
+                }
+                if (instanceIndex >= m_model4PlaneStates.size() || m_model4PlaneStates[instanceIndex] == 0u)
+                {
+                    continue;
+                }
+
+                const SceneInstance& instance = m_sceneInstances[instanceIndex];
+                if (instance.sourceModelIndex != 3u)
+                {
+                    continue;
+                }
+
+                CameraCB localCb = *cb;
+                localCb.world = simd_mul(simd_mul(MatTranslation(instance.worldOffset),
+                                                  MatBillboardFacingCamera(instance.worldOffset, m_camPos)),
+                                         MatScale(m_model4PlaneScale));
+                [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
+                [enc setVertexBytes:&m_model4PlaneMaterial length:sizeof(MaterialGPU) atIndex:2];
+                [enc setFragmentBytes:&m_model4PlaneMaterial length:sizeof(MaterialGPU) atIndex:1];
+
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:m_model4PlaneIndexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:m_model4PlaneIB
+                         indexBufferOffset:0];
+            }
+
+            [enc setVertexBuffer:m_vb offset:0 atIndex:0];
         }
 
         [enc endEncoding];

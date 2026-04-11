@@ -92,7 +92,10 @@ private:
 
     id<MTLBuffer> m_vb = nil;
     id<MTLBuffer> m_ib = nil;
+    id<MTLBuffer> m_model4PlaneVB = nil;
+    id<MTLBuffer> m_model4PlaneIB = nil;
     uint32_t m_indexCount = 0;
+    uint32_t m_model4PlaneIndexCount = 0;
     std::vector<VertexPNT> m_cpuVertices;
     std::vector<uint32_t> m_cpuIndices;
     std::vector<CollisionTriangle> m_collisionTriangles;
@@ -106,6 +109,9 @@ private:
     std::vector<id<MTLTexture>> m_diffuseTextures;
     std::vector<id<MTLTexture>> m_normalTextures;
     std::vector<id<MTLTexture>> m_heightTextures;
+    std::vector<uint8_t> m_model4PlaneStates;
+    MaterialGPU m_model4PlaneMaterial;
+    id<MTLTexture> m_model4PlaneTexture = nil;
     simd::float3 m_camPos = { 0.0f, 0.0f, 3.0f };
     float        m_camSpeed = 120.0f; // units/sec
     
@@ -136,6 +142,9 @@ private:
     bool m_enableFrustumCulling = true;
     bool m_enableBvhFrustumCulling = true;
     int m_model4InstanceCount = 20000;
+    float m_model4PlaneSwapDistance = 200.0f;
+    float m_model4PlaneSwapHysteresis = 25.0f;
+    float m_model4PlaneScale = 7.5f;
     std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f};
     std::vector<simd::float3> m_modelOffsets =
     {
@@ -150,6 +159,7 @@ private:
     void CreateShadersAndPSO();
     void CreateConstantBuffer();
     void LoadObjMesh();
+    void CreateModel4PlaneResources();
     void CreateSamplerAndFallbackTexture();
     id<MTLTexture> LoadTextureOrNil(const std::string& path, bool srgb);
     void BuildSceneBVH();
