@@ -1,5 +1,6 @@
 #pragma once
 #import <MetalKit/MetalKit.h>
+#include <cstdint>
 #include <vector>
 #include "DirectionalLight.hpp"
 #include "GBuffer.hpp"
@@ -20,6 +21,37 @@ private:
         uint32_t indexCount = 0;
         uint32_t materialIndex = 0;
         uint32_t sourceModelIndex = 0;
+        uint32_t instanceIndex = 0;
+    };
+
+    struct ModelBounds
+    {
+        simd::float3 localAabbMin = {0.0f, 0.0f, 0.0f};
+        simd::float3 localAabbMax = {0.0f, 0.0f, 0.0f};
+        simd::float3 localCenter = {0.0f, 0.0f, 0.0f};
+        float localRadius = 1.0f;
+    };
+
+    struct SceneInstance
+    {
+        uint32_t sourceModelIndex = 0;
+        simd::float3 worldOffset = {0.0f, 0.0f, 0.0f};
+        simd::float3 worldAabbMin = {0.0f, 0.0f, 0.0f};
+        simd::float3 worldAabbMax = {0.0f, 0.0f, 0.0f};
+        simd::float3 worldCenter = {0.0f, 0.0f, 0.0f};
+        float worldRadius = 1.0f;
+        float scale = 1.0f;
+    };
+
+    struct BvhNode
+    {
+        simd::float3 aabbMin = {0.0f, 0.0f, 0.0f};
+        simd::float3 aabbMax = {0.0f, 0.0f, 0.0f};
+        uint32_t leftChild = UINT32_MAX;
+        uint32_t rightChild = UINT32_MAX;
+        uint32_t firstInstance = 0;
+        uint32_t instanceCount = 0;
+        bool isLeaf = false;
     };
 
     struct MaterialGPU
@@ -65,6 +97,11 @@ private:
     std::vector<uint32_t> m_cpuIndices;
     std::vector<CollisionTriangle> m_collisionTriangles;
     std::vector<DrawBatch> m_batches;
+    std::vector<ModelBounds> m_modelBounds;
+    std::vector<SceneInstance> m_sceneInstances;
+    std::vector<uint32_t> m_bvhInstanceIndices;
+    std::vector<BvhNode> m_bvhNodes;
+    std::vector<uint8_t> m_visibleInstances;
     std::vector<MaterialGPU> m_materials;
     std::vector<id<MTLTexture>> m_diffuseTextures;
     std::vector<id<MTLTexture>> m_normalTextures;
@@ -96,12 +133,16 @@ private:
     float m_textureNearSpeedMultiplier = 4.0f;
     float m_textureFarSpeedMultiplier = 0.35f;
     float m_textureFarDistance = 8.0f;
-    std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f};
+    bool m_enableFrustumCulling = true;
+    bool m_enableBvhFrustumCulling = true;
+    int m_model4InstanceCount = 20000;
+    std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f};
     std::vector<simd::float3> m_modelOffsets =
     {
         simd::float3{0.0f, 0.0f, 0.0f},
         simd::float3{0.0f, 0.0f, 0.0f},
-        simd::float3{25.0f, 0.0f, 0.0f}
+        simd::float3{25.0f, 0.0f, 0.0f},
+        simd::float3{50.0f, 0.0f, 0.0f}
     };
 
     void CreateDeviceAndSwapchain();
@@ -111,6 +152,8 @@ private:
     void LoadObjMesh();
     void CreateSamplerAndFallbackTexture();
     id<MTLTexture> LoadTextureOrNil(const std::string& path, bool srgb);
+    void BuildSceneBVH();
+    uint32_t BuildSceneBVHNode(uint32_t begin, uint32_t end);
     float GetTessellationStrengthForModel(uint32_t modelIndex) const;
     simd::float3 GetOffsetForModel(uint32_t modelIndex) const;
 };

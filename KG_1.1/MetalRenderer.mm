@@ -14,8 +14,10 @@
 
 #include <unistd.h>
 #include <sys/stat.h>
+#include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -75,6 +77,64 @@ static inline simd_float4x4 MatTranslation(simd_float3 t)
     simd_float4x4 m = matrix_identity_float4x4;
     m.columns[3] = (simd_float4){ t.x, t.y, t.z, 1.0f };
     return m;
+}
+
+static inline simd_float4x4 MatScale(float s)
+{
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[0].x = s;
+    m.columns[1].y = s;
+    m.columns[2].z = s;
+    return m;
+}
+
+static bool IsSphereVisibleInFrustum(const simd::float4x4& viewMatrix,
+                                     simd::float3 worldCenter,
+                                     float radius,
+                                     float nearPlane,
+                                     float farPlane,
+                                     float tanHalfFovX,
+                                     float tanHalfFovY)
+{
+    const simd::float4 centerView4 = viewMatrix * simd::float4{worldCenter.x, worldCenter.y, worldCenter.z, 1.0f};
+    const simd::float3 centerView = simd::float3{centerView4.x, centerView4.y, centerView4.z};
+    const float depth = -centerView.z;
+
+    if (depth + radius < nearPlane)
+    {
+        return false;
+    }
+    if (depth - radius > farPlane)
+    {
+        return false;
+    }
+    if (fabsf(centerView.x) > depth * tanHalfFovX + radius)
+    {
+        return false;
+    }
+    if (fabsf(centerView.y) > depth * tanHalfFovY + radius)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static simd::float3 MinVec3(simd::float3 a, simd::float3 b)
+{
+    return simd::float3{fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z)};
+}
+
+static simd::float3 MaxVec3(simd::float3 a, simd::float3 b)
+{
+    return simd::float3{fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z)};
+}
+
+static float ComponentForAxis(simd::float3 v, int axis)
+{
+    if (axis == 0) return v.x;
+    if (axis == 1) return v.y;
+    return v.z;
 }
 
 static bool FileExists(const char* p)
@@ -322,6 +382,93 @@ simd::float3 MetalRenderer::GetOffsetForModel(uint32_t modelIndex) const
     return simd::float3{0.0f, 0.0f, 0.0f};
 }
 
+
+void MetalRenderer::BuildSceneBVH()
+{
+    m_bvhNodes.clear();
+    m_bvhInstanceIndices.clear();
+    m_visibleInstances.assign(m_sceneInstances.size(), 0u);
+    if (m_sceneInstances.empty())
+    {
+        return;
+    }
+
+    m_bvhInstanceIndices.resize(m_sceneInstances.size());
+    for (uint32_t i = 0; i < m_sceneInstances.size(); ++i)
+    {
+        m_bvhInstanceIndices[i] = i;
+    }
+
+    BuildSceneBVHNode(0u, (uint32_t)m_bvhInstanceIndices.size());
+}
+
+uint32_t MetalRenderer::BuildSceneBVHNode(uint32_t begin, uint32_t end)
+{
+    BvhNode node;
+    node.firstInstance = begin;
+    node.instanceCount = end - begin;
+
+    const SceneInstance& firstInstance = m_sceneInstances[m_bvhInstanceIndices[begin]];
+    simd::float3 boundsMin = firstInstance.worldAabbMin;
+    simd::float3 boundsMax = firstInstance.worldAabbMax;
+    simd::float3 centroidMin = firstInstance.worldCenter;
+    simd::float3 centroidMax = firstInstance.worldCenter;
+
+    for (uint32_t i = begin + 1; i < end; ++i)
+    {
+        const SceneInstance& instance = m_sceneInstances[m_bvhInstanceIndices[i]];
+        boundsMin = MinVec3(boundsMin, instance.worldAabbMin);
+        boundsMax = MaxVec3(boundsMax, instance.worldAabbMax);
+        centroidMin = MinVec3(centroidMin, instance.worldCenter);
+        centroidMax = MaxVec3(centroidMax, instance.worldCenter);
+    }
+
+    node.aabbMin = boundsMin;
+    node.aabbMax = boundsMax;
+
+    const uint32_t nodeIndex = (uint32_t)m_bvhNodes.size();
+    m_bvhNodes.push_back(node);
+
+    const uint32_t instanceCount = end - begin;
+    if (instanceCount <= 16u)
+    {
+        m_bvhNodes[nodeIndex].isLeaf = true;
+        return nodeIndex;
+    }
+
+    const simd::float3 centroidExtent = centroidMax - centroidMin;
+    int splitAxis = 0;
+    if (centroidExtent.y > centroidExtent.x && centroidExtent.y >= centroidExtent.z)
+    {
+        splitAxis = 1;
+    }
+    else if (centroidExtent.z > centroidExtent.x && centroidExtent.z >= centroidExtent.y)
+    {
+        splitAxis = 2;
+    }
+
+    if (ComponentForAxis(centroidExtent, splitAxis) < 1e-5f)
+    {
+        m_bvhNodes[nodeIndex].isLeaf = true;
+        return nodeIndex;
+    }
+
+    const uint32_t mid = begin + instanceCount / 2u;
+    std::nth_element(m_bvhInstanceIndices.begin() + begin,
+                     m_bvhInstanceIndices.begin() + mid,
+                     m_bvhInstanceIndices.begin() + end,
+                     [&](uint32_t lhsIndex, uint32_t rhsIndex)
+                     {
+                         const float lhs = ComponentForAxis(m_sceneInstances[lhsIndex].worldCenter, splitAxis);
+                         const float rhs = ComponentForAxis(m_sceneInstances[rhsIndex].worldCenter, splitAxis);
+                         return lhs < rhs;
+                     });
+
+    m_bvhNodes[nodeIndex].leftChild = BuildSceneBVHNode(begin, mid);
+    m_bvhNodes[nodeIndex].rightChild = BuildSceneBVHNode(mid, end);
+    return nodeIndex;
+}
+
 void MetalRenderer::CreateDeviceAndSwapchain()
 {
     m_device = MTLCreateSystemDefaultDevice();
@@ -421,6 +568,11 @@ void MetalRenderer::LoadObjMesh()
     m_cpuVertices.clear();
     m_cpuIndices.clear();
     m_collisionTriangles.clear();
+    m_modelBounds.clear();
+    m_sceneInstances.clear();
+    m_bvhNodes.clear();
+    m_bvhInstanceIndices.clear();
+    m_visibleInstances.clear();
 
     // Keep the original fixed camera start.
     m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
@@ -454,6 +606,8 @@ void MetalRenderer::LoadObjMesh()
         const uint32_t vertexBase = (uint32_t)m_cpuVertices.size();
         const uint32_t indexBase = (uint32_t)m_cpuIndices.size();
         const uint32_t materialBase = (uint32_t)m_materials.size();
+        simd::float3 modelAabbMin = simd::float3{mesh.vertices[0].px, mesh.vertices[0].py, mesh.vertices[0].pz};
+        simd::float3 modelAabbMax = modelAabbMin;
 
         if (!haveBounds)
         {
@@ -465,6 +619,12 @@ void MetalRenderer::LoadObjMesh()
         for (const VertexPNT& v : mesh.vertices)
         {
             m_cpuVertices.push_back(v);
+            if (v.px < modelAabbMin.x) modelAabbMin.x = v.px;
+            if (v.py < modelAabbMin.y) modelAabbMin.y = v.py;
+            if (v.pz < modelAabbMin.z) modelAabbMin.z = v.pz;
+            if (v.px > modelAabbMax.x) modelAabbMax.x = v.px;
+            if (v.py > modelAabbMax.y) modelAabbMax.y = v.py;
+            if (v.pz > modelAabbMax.z) modelAabbMax.z = v.pz;
             if (v.px < m_meshAabbMin.x) m_meshAabbMin.x = v.px;
             if (v.py < m_meshAabbMin.y) m_meshAabbMin.y = v.py;
             if (v.pz < m_meshAabbMin.z) m_meshAabbMin.z = v.pz;
@@ -489,6 +649,7 @@ void MetalRenderer::LoadObjMesh()
             const simd::float3 b = simd::float3{vb.px, vb.py, vb.pz};
             const simd::float3 c = simd::float3{vc.px, vc.py, vc.pz};
             const simd::float3 normal = simd::cross(b - a, c - a);
+            
             if (simd::length_squared(normal) < 1e-8f)
             {
                 continue;
@@ -554,15 +715,60 @@ void MetalRenderer::LoadObjMesh()
             m_heightTextures.push_back(heightTex);
         }
 
-        m_batches.reserve(m_batches.size() + mesh.submeshes.size());
-        for (const ObjSubmesh& sm : mesh.submeshes)
+        const uint32_t sourceModelIndex = (uint32_t)modelIndex;
+        if (m_modelBounds.size() <= sourceModelIndex)
         {
-            DrawBatch b;
-            b.indexOffset = indexBase + sm.indexOffset;
-            b.indexCount = sm.indexCount;
-            b.materialIndex = materialBase + sm.materialIndex;
-            b.sourceModelIndex = (uint32_t)modelIndex;
-            m_batches.push_back(b);
+            m_modelBounds.resize(sourceModelIndex + 1u);
+        }
+        ModelBounds modelBounds;
+        modelBounds.localAabbMin = modelAabbMin;
+        modelBounds.localAabbMax = modelAabbMax;
+        modelBounds.localCenter = (modelAabbMin + modelAabbMax) * 0.5f;
+        modelBounds.localRadius = simd::length((modelAabbMax - modelAabbMin) * 0.5f);
+        if (modelBounds.localRadius < 1.0f)
+        {
+            modelBounds.localRadius = 1.0f;
+        }
+        m_modelBounds[sourceModelIndex] = modelBounds;
+        const simd::float3 baseOffset = GetOffsetForModel(sourceModelIndex);
+        const bool isModel4 = (sourceModelIndex == 3u);
+        const int instanceCount = isModel4 ? m_model4InstanceCount : 1;
+        const int gridSize = 100;
+        const float spacing = 12.0f;
+
+        m_batches.reserve(m_batches.size() + mesh.submeshes.size() * (size_t)instanceCount);
+        for (int instanceIndex = 0; instanceIndex < instanceCount; ++instanceIndex)
+        {
+            simd::float3 instanceOffset = baseOffset;
+            if (isModel4)
+            {
+                const int row = instanceIndex / gridSize;
+                const int col = instanceIndex % gridSize;
+                instanceOffset.x += (float)col * spacing;
+                instanceOffset.z += (float)row * spacing;
+            }
+
+            SceneInstance instance;
+            instance.sourceModelIndex = sourceModelIndex;
+            instance.worldOffset = instanceOffset;
+            instance.scale = isModel4 ? 5.0f : 1.0f;
+            instance.worldAabbMin = instanceOffset + modelBounds.localAabbMin * instance.scale;
+            instance.worldAabbMax = instanceOffset + modelBounds.localAabbMax * instance.scale;
+            instance.worldCenter = instanceOffset + modelBounds.localCenter * instance.scale;
+            instance.worldRadius = modelBounds.localRadius * instance.scale;
+            const uint32_t sceneInstanceIndex = (uint32_t)m_sceneInstances.size();
+            m_sceneInstances.push_back(instance);
+
+            for (const ObjSubmesh& sm : mesh.submeshes)
+            {
+                DrawBatch b;
+                b.indexOffset = indexBase + sm.indexOffset;
+                b.indexCount = sm.indexCount;
+                b.materialIndex = materialBase + sm.materialIndex;
+                b.sourceModelIndex = sourceModelIndex;
+                b.instanceIndex = sceneInstanceIndex;
+                m_batches.push_back(b);
+            }
         }
     }
 
@@ -580,6 +786,8 @@ void MetalRenderer::LoadObjMesh()
     {
         m_meshRadius = 1.0f;
     }
+
+    BuildSceneBVH();
 
     m_vb = [m_device newBufferWithBytes:m_cpuVertices.data()
                                  length:m_cpuVertices.size() * sizeof(VertexPNT)
@@ -743,6 +951,16 @@ void MetalRenderer::DrawFrame()
         if (inp.KeyHeld(2))   m_camPos += right * (m_camSpeed * dt);   // D
         if (inp.KeyHeld(49))  m_camPos.y += m_camSpeed * dt;           // Space
         if (inp.ModifierShift()) m_camPos.y -= m_camSpeed * dt;        // Shift — вниз
+        if (inp.KeyPressed(17)) // T
+        {
+            m_enableFrustumCulling = !m_enableFrustumCulling;
+            NSLog(@"Frustum culling %@", m_enableFrustumCulling ? @"enabled" : @"disabled");
+        }
+        if (inp.KeyPressed(16)) // Y
+        {
+            m_enableBvhFrustumCulling = !m_enableBvhFrustumCulling;
+            NSLog(@"BVH frustum culling %@", m_enableBvhFrustumCulling ? @"enabled" : @"disabled");
+        }
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -774,6 +992,8 @@ void MetalRenderer::DrawFrame()
             1.0f - ((cameraToMeshDistance - tessellationFadeNear) /
                     (tessellationFadeFar - tessellationFadeNear));
         tessellationFactor = fmaxf(0.0f, fminf(tessellationFactor, 1.0f));
+        const float tanHalfFovY = tanf(60.0f * (float)M_PI / 360.0f);
+        const float tanHalfFovX = tanHalfFovY * aspect;
 
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
@@ -787,8 +1007,95 @@ void MetalRenderer::DrawFrame()
         [enc setFragmentSamplerState:m_sampler atIndex:0];
         [enc setVertexSamplerState:m_sampler atIndex:0];
 
+        if (!m_visibleInstances.empty())
+        {
+            std::fill(m_visibleInstances.begin(), m_visibleInstances.end(), 0u);
+        }
+
+        if (!m_enableFrustumCulling)
+        {
+            std::fill(m_visibleInstances.begin(), m_visibleInstances.end(), 1u);
+        }
+        else if (m_enableBvhFrustumCulling && !m_bvhNodes.empty())
+        {
+            std::vector<uint32_t> nodeStack;
+            nodeStack.push_back(0u);
+            while (!nodeStack.empty())
+            {
+                const uint32_t nodeIndex = nodeStack.back();
+                nodeStack.pop_back();
+
+                const BvhNode& node = m_bvhNodes[nodeIndex];
+                const simd::float3 nodeCenter = (node.aabbMin + node.aabbMax) * 0.5f;
+                const float nodeRadius = simd::length((node.aabbMax - node.aabbMin) * 0.5f);
+                if (!IsSphereVisibleInFrustum(cb->view,
+                                              nodeCenter,
+                                              nodeRadius,
+                                              nearPlane,
+                                              farPlane,
+                                              tanHalfFovX,
+                                              tanHalfFovY))
+                {
+                    continue;
+                }
+
+                if (node.isLeaf)
+                {
+                    for (uint32_t i = 0; i < node.instanceCount; ++i)
+                    {
+                        const uint32_t instanceIndex = m_bvhInstanceIndices[node.firstInstance + i];
+                        const SceneInstance& instance = m_sceneInstances[instanceIndex];
+                        if (IsSphereVisibleInFrustum(cb->view,
+                                                     instance.worldCenter,
+                                                     instance.worldRadius,
+                                                     nearPlane,
+                                                     farPlane,
+                                                     tanHalfFovX,
+                                                     tanHalfFovY))
+                        {
+                            m_visibleInstances[instanceIndex] = 1u;
+                        }
+                    }
+                }
+                else
+                {
+                    if (node.leftChild != UINT32_MAX)
+                    {
+                        nodeStack.push_back(node.leftChild);
+                    }
+                    if (node.rightChild != UINT32_MAX)
+                    {
+                        nodeStack.push_back(node.rightChild);
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (uint32_t instanceIndex = 0; instanceIndex < m_sceneInstances.size(); ++instanceIndex)
+            {
+                const SceneInstance& instance = m_sceneInstances[instanceIndex];
+                if (IsSphereVisibleInFrustum(cb->view,
+                                             instance.worldCenter,
+                                             instance.worldRadius,
+                                             nearPlane,
+                                             farPlane,
+                                             tanHalfFovX,
+                                             tanHalfFovY))
+                {
+                    m_visibleInstances[instanceIndex] = 1u;
+                }
+            }
+        }
+
         for (const DrawBatch& b : m_batches)
         {
+            if (b.instanceIndex >= m_visibleInstances.size() || m_visibleInstances[b.instanceIndex] == 0u)
+            {
+                continue;
+            }
+
+            const SceneInstance& instance = m_sceneInstances[b.instanceIndex];
             MaterialGPU mat{};
             if (b.materialIndex < m_materials.size())
             {
@@ -800,7 +1107,7 @@ void MetalRenderer::DrawFrame()
             mat.detailParams.x = displacementStrength;
 
             CameraCB localCb = *cb;
-            localCb.world = MatTranslation(GetOffsetForModel(b.sourceModelIndex));
+            localCb.world = simd_mul(MatTranslation(instance.worldOffset), MatScale(instance.scale));
             [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
             [enc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
             [enc setFragmentBytes:&mat length:sizeof(MaterialGPU) atIndex:1];
