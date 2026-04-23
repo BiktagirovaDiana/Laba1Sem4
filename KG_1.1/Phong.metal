@@ -38,6 +38,110 @@ struct MaterialCB
     float4 detailParams;
 };
 
+struct StructuredBufferElement
+{
+    uint value;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+struct ParticleAnimationCB
+{
+    float4 centerAndFactor;
+    uint instanceCount;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+struct DustAnimationCB
+{
+    float4 centerAndTime;
+    float4 motionParams;
+    uint instanceCount;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+struct ParticleInstance
+{
+    float4 baseCenterAndSize;
+    float4 animatedCenterAndSeed;
+};
+
+static float Hash01(float value)
+{
+    return fract(sin(value * 12.9898) * 43758.5453);
+}
+
+static float3 DustDirection(uint planeIndex)
+{
+    const float fi = float(planeIndex) + 1.0;
+    const float z = Hash01(fi * 3.17) * 2.0 - 1.0;
+    const float angle = Hash01(fi * 7.91) * 6.28318530718;
+    const float xyRadius = sqrt(max(0.0, 1.0 - z * z));
+    return normalize(float3(cos(angle) * xyRadius, sin(angle) * xyRadius, z));
+}
+
+kernel void cs_update_particles(const device ParticleInstance* baseInstances [[buffer(0)]],
+                                device ParticleInstance* animatedInstances [[buffer(1)]],
+                                constant ParticleAnimationCB& cb [[buffer(2)]],
+                                uint instanceId [[thread_position_in_grid]])
+{
+    if (instanceId >= cb.instanceCount)
+    {
+        return;
+    }
+
+    const float3 center = cb.centerAndFactor.xyz;
+    const float sphereFactor = cb.centerAndFactor.w;
+    const ParticleInstance baseInstance = baseInstances[instanceId];
+    const float3 baseCenter = baseInstance.baseCenterAndSize.xyz;
+    const float3 animatedCenter = center + (baseCenter - center) * sphereFactor;
+
+    ParticleInstance animatedInstance = baseInstance;
+    animatedInstance.animatedCenterAndSeed.xyz = animatedCenter;
+    animatedInstances[instanceId] = animatedInstance;
+}
+
+kernel void cs_update_dust_particles(const device ParticleInstance* baseInstances [[buffer(0)]],
+                                     device ParticleInstance* animatedInstances [[buffer(1)]],
+                                     constant DustAnimationCB& cb [[buffer(2)]],
+                                     uint instanceId [[thread_position_in_grid]])
+{
+    if (instanceId >= cb.instanceCount)
+    {
+        return;
+    }
+
+    const float fi = float(instanceId) + 1.0;
+    const float3 driftDir = DustDirection(instanceId);
+    const float3 center = cb.centerAndTime.xyz;
+    const float time = cb.centerAndTime.w;
+    const float driftAmplitude = cb.motionParams.x;
+    const float driftSpeed = cb.motionParams.y;
+    const float swirlAmplitude = cb.motionParams.z;
+
+    const float phaseA = Hash01(fi * 11.3) * 6.28318530718;
+    const float phaseB = Hash01(fi * 19.7) * 6.28318530718;
+
+    const ParticleInstance baseInstance = baseInstances[instanceId];
+    const float3 baseCenter = baseInstance.baseCenterAndSize.xyz;
+    const float3 fromCenter =
+        normalize(baseCenter - center + driftDir * 0.001);
+    const float3 swirlDir = normalize(cross(driftDir, fromCenter) + DustDirection(instanceId + 137u) * 0.15);
+
+    const float drift = sin(time * driftSpeed + phaseA) * driftAmplitude;
+    const float hover = cos(time * driftSpeed * 1.7 + phaseB) * swirlAmplitude;
+    const float3 offset = driftDir * drift + swirlDir * hover;
+
+    ParticleInstance animatedInstance = baseInstance;
+    animatedInstance.animatedCenterAndSeed.xyz = baseCenter + offset;
+    animatedInstances[instanceId] = animatedInstance;
+}
+
 struct VSOut
 {
     float4 position [[position]];
@@ -106,6 +210,40 @@ vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
 
     o.worldPos = wp.xyz;
     o.worldN = normalize((cb.world * float4(vin.normal, 0.0)).xyz);
+    o.uv = uv;
+    return o;
+}
+
+vertex VSOut vs_particle_billboard(VertexIn vin [[stage_in]],
+                                   constant CameraCB& cb [[buffer(1)]],
+                                   constant MaterialCB& mat [[buffer(2)]],
+                                   const device ParticleInstance* instances [[buffer(3)]],
+                                   uint instanceId [[instance_id]])
+{
+    const ParticleInstance instance = instances[instanceId];
+    const float3 center = instance.animatedCenterAndSeed.xyz;
+    const float size = instance.baseCenterAndSize.w;
+
+    float3 forward = normalize(cb.cameraPos - center);
+    float3 upHint = float3(0.0, 1.0, 0.0);
+    float3 right = cross(upHint, forward);
+    if (dot(right, right) < 1e-5)
+    {
+        upHint = float3(1.0, 0.0, 0.0);
+        right = cross(upHint, forward);
+    }
+    right = normalize(right);
+    const float3 up = normalize(cross(forward, right));
+
+    const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
+    const float3 worldPos = center + right * (vin.position.x * size) + up * (vin.position.y * size);
+    const float4 wp = float4(worldPos, 1.0);
+    const float4 vp = cb.view * wp;
+
+    VSOut o;
+    o.position = cb.proj * vp;
+    o.worldPos = worldPos;
+    o.worldN = forward;
     o.uv = uv;
     return o;
 }

@@ -5,6 +5,7 @@
 #include "DirectionalLight.hpp"
 #include "GBuffer.hpp"
 #include "ObjLoader.hpp"
+#include "Particle.hpp"
 
 class MetalRenderer
 {
@@ -74,13 +75,51 @@ private:
         simd::float3 aabbMax;
     };
 
+    struct StructuredBufferElement
+    {
+        uint32_t value = 0;
+        uint32_t pad0 = 0;
+        uint32_t pad1 = 0;
+        uint32_t pad2 = 0;
+    };
+
+    struct ParticleAnimationCB
+    {
+        simd::float4 centerAndFactor = {0.0f, 0.0f, 0.0f, 1.0f};
+        uint32_t instanceCount = 0;
+        uint32_t pad0 = 0;
+        uint32_t pad1 = 0;
+        uint32_t pad2 = 0;
+    };
+
+    struct DustAnimationCB
+    {
+        simd::float4 centerAndTime = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 motionParams = {1.0f, 1.0f, 1.0f, 0.0f};
+        uint32_t instanceCount = 0;
+        uint32_t pad0 = 0;
+        uint32_t pad1 = 0;
+        uint32_t pad2 = 0;
+    };
+
+    struct ParticleInstanceGPU
+    {
+        simd::float4 baseCenterAndSize = {0.0f, 0.0f, 0.0f, 1.0f};
+        simd::float4 animatedCenterAndSeed = {0.0f, 0.0f, 0.0f, 0.0f};
+    };
+
+    static constexpr uint32_t kStructuredBufferCapacity = 1024;
+
     MTKView* m_view = nullptr;
 
     id<MTLDevice> m_device = nil;
     id<MTLCommandQueue> m_queue = nil;
 
     id<MTLRenderPipelineState> m_gbufferPSO = nil;
+    id<MTLRenderPipelineState> m_particleBillboardPSO = nil;
     id<MTLRenderPipelineState> m_lightingPSO = nil;
+    id<MTLComputePipelineState> m_particleComputePSO = nil;
+    id<MTLComputePipelineState> m_dustComputePSO = nil;
     id<MTLDepthStencilState>   m_dss = nil;
     id<MTLTexture>             m_whiteTex = nil;
     id<MTLTexture>             m_blackTex = nil;
@@ -94,8 +133,21 @@ private:
     id<MTLBuffer> m_ib = nil;
     id<MTLBuffer> m_model4PlaneVB = nil;
     id<MTLBuffer> m_model4PlaneIB = nil;
+    id<MTLBuffer> m_particleQuadVB = nil;
+    id<MTLBuffer> m_particleQuadIB = nil;
+    id<MTLBuffer> m_particleBaseInstanceBuffer = nil;
+    id<MTLBuffer> m_particleInstanceBuffer = nil;
+    id<MTLBuffer> m_dustBaseInstanceBuffer = nil;
+    id<MTLBuffer> m_dustInstanceBuffer = nil;
+    id<MTLBuffer> m_appendStructuredBuffer = nil;
+    id<MTLBuffer> m_appendCounterBuffer = nil;
+    id<MTLBuffer> m_consumeStructuredBuffer = nil;
+    id<MTLBuffer> m_consumeCounterBuffer = nil;
     uint32_t m_indexCount = 0;
     uint32_t m_model4PlaneIndexCount = 0;
+    uint32_t m_particleQuadIndexCount = 0;
+    uint32_t m_particleInstanceCount = 0;
+    uint32_t m_dustParticleInstanceCount = 0;
     std::vector<VertexPNT> m_cpuVertices;
     std::vector<uint32_t> m_cpuIndices;
     std::vector<CollisionTriangle> m_collisionTriangles;
@@ -110,8 +162,11 @@ private:
     std::vector<id<MTLTexture>> m_normalTextures;
     std::vector<id<MTLTexture>> m_heightTextures;
     std::vector<uint8_t> m_model4PlaneStates;
+    std::vector<VertexPNT> m_particleBaseVertices;
     MaterialGPU m_model4PlaneMaterial;
     id<MTLTexture> m_model4PlaneTexture = nil;
+    id<MTLTexture> m_particleTexture = nil;
+    id<MTLTexture> m_dustParticleTexture = nil;
     simd::float3 m_camPos = { 0.0f, 0.0f, 3.0f };
     float        m_camSpeed = 120.0f; // units/sec
     
@@ -145,6 +200,23 @@ private:
     float m_model4PlaneSwapDistance = 200.0f;
     float m_model4PlaneSwapHysteresis = 25.0f;
     float m_model4PlaneScale = 7.5f;
+    uint32_t m_particlePlaneCount = 128;
+    float m_particleRadius = 35.0f;
+    float m_particlePlaneSize = 2.0f;
+    simd::float3 m_particleCenter = {0.0f, 2.0f, 0.0f};
+    float m_particleAnimationTime = 0.0f;
+    float m_particleCycleSeconds = 2.4f;
+    float m_particleCollapsePart = 0.72f;
+    MaterialGPU m_particleMaterial;
+    uint32_t m_dustParticlePlaneCount = 1080;
+    float m_dustParticleRadius = 80.0f;
+    float m_dustParticlePlaneSize = 0.65f;
+    simd::float3 m_dustParticleCenter = {0.0f, 18.0f, 0.0f};
+    float m_dustAnimationTime = 0.0f;
+    float m_dustDriftAmplitude = 11.0f;
+    float m_dustDriftSpeed = 0.22f;
+    float m_dustSwirlAmplitude = 2.5f;
+    MaterialGPU m_dustParticleMaterial;
     std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f};
     std::vector<simd::float3> m_modelOffsets =
     {
@@ -158,6 +230,11 @@ private:
     void CreateDepth();
     void CreateShadersAndPSO();
     void CreateConstantBuffer();
+    void CreateStructuredBuffers();
+    void CreateParticleResources();
+    void CreateDustParticleResources();
+    void UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt);
+    void UpdateDustParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt);
     void LoadObjMesh();
     void CreateModel4PlaneResources();
     void CreateSamplerAndFallbackTexture();

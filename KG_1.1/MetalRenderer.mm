@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -339,6 +340,12 @@ static simd::float3 Max3(simd::float3 a, simd::float3 b, simd::float3 c)
                         fmaxf(a.z, fmaxf(b.z, c.z))};
 }
 
+static float SmoothStep01(float t)
+{
+    t = fmaxf(0.0f, fminf(t, 1.0f));
+    return t * t * (3.0f - 2.0f * t);
+}
+
 static std::string ResolveAssetPath(const std::string& fileName)
 {
     for (const std::string& d : GetAssetCandidateDirs())
@@ -382,6 +389,19 @@ static ObjMesh CreateTexturedPlaneMesh(const std::string& diffuseTexturePath)
     return mesh;
 }
 
+static ObjMesh CreateUnitBillboardQuadMesh()
+{
+    ObjMesh mesh;
+    mesh.vertices =
+    {
+        VertexPNT{-0.5f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+        VertexPNT{ 0.5f, -0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        VertexPNT{ 0.5f,  0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+        VertexPNT{-0.5f,  0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}
+    };
+    mesh.indices = {0u, 1u, 2u, 0u, 2u, 3u};
+    return mesh;
+}
 
 struct CameraCB
 {
@@ -408,8 +428,11 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateDepth();
     CreateShadersAndPSO();
     CreateConstantBuffer();
+    CreateStructuredBuffers();
     CreateSamplerAndFallbackTexture();
     CreateModel4PlaneResources();
+    CreateParticleResources();
+    CreateDustParticleResources();
     m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
     m_camSpeed = 120.0f;
     m_yaw = (float)M_PI;
@@ -590,6 +613,20 @@ void MetalRenderer::CreateShadersAndPSO()
     m_gbufferPSO = [m_device newRenderPipelineStateWithDescriptor:psoDesc error:&err];
     if (!m_gbufferPSO) { NSLog(@"GBuffer PSO error: %@", err); }
 
+    id<MTLFunction> vsParticleBillboard = [lib newFunctionWithName:@"vs_particle_billboard"];
+    MTLRenderPipelineDescriptor* particleDesc = [MTLRenderPipelineDescriptor new];
+    particleDesc.vertexFunction = vsParticleBillboard;
+    particleDesc.fragmentFunction = ps;
+    particleDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    particleDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+    particleDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
+    particleDesc.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
+    particleDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    particleDesc.vertexDescriptor = vd;
+
+    m_particleBillboardPSO = [m_device newRenderPipelineStateWithDescriptor:particleDesc error:&err];
+    if (!m_particleBillboardPSO) { NSLog(@"Particle billboard PSO error: %@", err); }
+
     id<MTLFunction> vsLighting = [lib newFunctionWithName:@"vs_fullscreen"];
     id<MTLFunction> psLighting = [lib newFunctionWithName:@"ps_lighting"];
 
@@ -601,12 +638,54 @@ void MetalRenderer::CreateShadersAndPSO()
 
     m_lightingPSO = [m_device newRenderPipelineStateWithDescriptor:lightingDesc error:&err];
     if (!m_lightingPSO) { NSLog(@"Lighting PSO error: %@", err); }
+
+    id<MTLFunction> particleCompute = [lib newFunctionWithName:@"cs_update_particles"];
+    m_particleComputePSO = [m_device newComputePipelineStateWithFunction:particleCompute error:&err];
+    if (!m_particleComputePSO) { NSLog(@"Particle compute PSO error: %@", err); }
+
+    id<MTLFunction> dustCompute = [lib newFunctionWithName:@"cs_update_dust_particles"];
+    m_dustComputePSO = [m_device newComputePipelineStateWithFunction:dustCompute error:&err];
+    if (!m_dustComputePSO) { NSLog(@"Dust particle compute PSO error: %@", err); }
 }
 
 void MetalRenderer::CreateConstantBuffer()
 {
     m_cameraCB = [m_device newBufferWithLength:sizeof(CameraCB)
                                        options:MTLResourceStorageModeShared];
+}
+
+void MetalRenderer::CreateStructuredBuffers()
+{
+    const NSUInteger bufferLength =
+        (NSUInteger)kStructuredBufferCapacity * sizeof(StructuredBufferElement);
+
+    m_appendStructuredBuffer = [m_device newBufferWithLength:bufferLength
+                                                     options:MTLResourceStorageModeShared];
+    m_consumeStructuredBuffer = [m_device newBufferWithLength:bufferLength
+                                                      options:MTLResourceStorageModeShared];
+    m_appendCounterBuffer = [m_device newBufferWithLength:sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+    m_consumeCounterBuffer = [m_device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+
+    if (!m_appendStructuredBuffer || !m_consumeStructuredBuffer ||
+        !m_appendCounterBuffer || !m_consumeCounterBuffer)
+    {
+        NSLog(@"Failed to create append/consume structured buffers.");
+        return;
+    }
+
+    std::memset(m_appendStructuredBuffer.contents, 0, bufferLength);
+
+    StructuredBufferElement* consumeData =
+        static_cast<StructuredBufferElement*>(m_consumeStructuredBuffer.contents);
+    for (uint32_t i = 0; i < kStructuredBufferCapacity; ++i)
+    {
+        consumeData[i].value = i;
+    }
+
+    *static_cast<uint32_t*>(m_appendCounterBuffer.contents) = 0u;
+    *static_cast<uint32_t*>(m_consumeCounterBuffer.contents) = kStructuredBufferCapacity;
 }
 
 
@@ -883,6 +962,214 @@ void MetalRenderer::CreateModel4PlaneResources()
     m_model4PlaneTexture = model4TexturePath.empty() ? nil : LoadTextureOrNil(model4TexturePath, true);
 }
 
+void MetalRenderer::CreateParticleResources()
+{
+    const std::string particleTexturePath = ResolveAssetPath("Particle1.png");
+    ObjMesh quadMesh = CreateUnitBillboardQuadMesh();
+    m_particleQuadIndexCount = (uint32_t)quadMesh.indices.size();
+    if (!quadMesh.vertices.empty() && !m_particleQuadVB)
+    {
+        m_particleQuadVB = [m_device newBufferWithBytes:quadMesh.vertices.data()
+                                                 length:quadMesh.vertices.size() * sizeof(VertexPNT)
+                                                options:MTLResourceStorageModeShared];
+    }
+    if (!quadMesh.indices.empty() && !m_particleQuadIB)
+    {
+        m_particleQuadIB = [m_device newBufferWithBytes:quadMesh.indices.data()
+                                                 length:quadMesh.indices.size() * sizeof(uint32_t)
+                                                options:MTLResourceStorageModeShared];
+    }
+
+    Particle particles(m_particlePlaneCount,
+                       m_particleRadius,
+                       m_particlePlaneSize,
+                       m_particleCenter);
+    ObjMesh particleMesh = particles.CreateMesh();
+    m_particleBaseVertices = particleMesh.vertices;
+
+    std::vector<ParticleInstanceGPU> instances;
+    instances.reserve(particleMesh.vertices.size() / 4u);
+    for (size_t i = 0; i + 3 < particleMesh.vertices.size(); i += 4)
+    {
+        const VertexPNT& v0 = particleMesh.vertices[i + 0];
+        const VertexPNT& v1 = particleMesh.vertices[i + 1];
+        const VertexPNT& v2 = particleMesh.vertices[i + 2];
+        const VertexPNT& v3 = particleMesh.vertices[i + 3];
+        const simd::float3 center =
+            (simd::float3{v0.px, v0.py, v0.pz} +
+             simd::float3{v1.px, v1.py, v1.pz} +
+             simd::float3{v2.px, v2.py, v2.pz} +
+             simd::float3{v3.px, v3.py, v3.pz}) * 0.25f;
+        const float width = simd::distance(simd::float3{v0.px, v0.py, v0.pz},
+                                           simd::float3{v1.px, v1.py, v1.pz});
+        const float height = simd::distance(simd::float3{v1.px, v1.py, v1.pz},
+                                            simd::float3{v2.px, v2.py, v2.pz});
+
+        ParticleInstanceGPU instance;
+        instance.baseCenterAndSize = simd::float4{center.x, center.y, center.z, fmaxf(fmaxf(width, height), 0.001f)};
+        instance.animatedCenterAndSeed = simd::float4{center.x, center.y, center.z, (float)instances.size()};
+        instances.push_back(instance);
+    }
+
+    m_particleInstanceCount = (uint32_t)instances.size();
+    if (!instances.empty())
+    {
+        m_particleBaseInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                             length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                            options:MTLResourceStorageModeShared];
+        m_particleInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                         length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                        options:MTLResourceStorageModeShared];
+    }
+
+    m_particleMaterial = {};
+    m_particleMaterial.kd_ns = simd::float4{0.9f, 0.95f, 1.0f, 8.0f};
+    m_particleMaterial.ks_alpha = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_particleMaterial.uvScale = simd::float2{1.0f, 1.0f};
+    m_particleMaterial.uvSpeed = simd::float2{0.0f, 0.0f};
+    m_particleMaterial.textureFlags = simd::uint4{particleTexturePath.empty() ? 0u : 1u, 0u, 0u, 1u};
+    m_particleMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+    m_particleTexture = particleTexturePath.empty() ? nil : LoadTextureOrNil(particleTexturePath, true);
+}
+
+void MetalRenderer::CreateDustParticleResources()
+{
+    const std::string dustTexturePath = ResolveAssetPath("Particle2.png");
+    Particle dustParticles(m_dustParticlePlaneCount,
+                           m_dustParticleRadius,
+                           m_dustParticlePlaneSize,
+                           m_dustParticleCenter);
+    ObjMesh dustMesh = dustParticles.CreateMesh();
+
+    std::vector<ParticleInstanceGPU> instances;
+    instances.reserve(dustMesh.vertices.size() / 4u);
+    for (size_t i = 0; i + 3 < dustMesh.vertices.size(); i += 4)
+    {
+        const VertexPNT& v0 = dustMesh.vertices[i + 0];
+        const VertexPNT& v1 = dustMesh.vertices[i + 1];
+        const VertexPNT& v2 = dustMesh.vertices[i + 2];
+        const VertexPNT& v3 = dustMesh.vertices[i + 3];
+        const simd::float3 center =
+            (simd::float3{v0.px, v0.py, v0.pz} +
+             simd::float3{v1.px, v1.py, v1.pz} +
+             simd::float3{v2.px, v2.py, v2.pz} +
+             simd::float3{v3.px, v3.py, v3.pz}) * 0.25f;
+        const float width = simd::distance(simd::float3{v0.px, v0.py, v0.pz},
+                                           simd::float3{v1.px, v1.py, v1.pz});
+        const float height = simd::distance(simd::float3{v1.px, v1.py, v1.pz},
+                                            simd::float3{v2.px, v2.py, v2.pz});
+
+        ParticleInstanceGPU instance;
+        instance.baseCenterAndSize = simd::float4{center.x, center.y, center.z, fmaxf(fmaxf(width, height), 0.001f)};
+        instance.animatedCenterAndSeed = simd::float4{center.x, center.y, center.z, (float)instances.size()};
+        instances.push_back(instance);
+    }
+
+    m_dustParticleInstanceCount = (uint32_t)instances.size();
+    if (!instances.empty())
+    {
+        m_dustBaseInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                         length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                        options:MTLResourceStorageModeShared];
+        m_dustInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                     length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                    options:MTLResourceStorageModeShared];
+    }
+
+    m_dustParticleMaterial = {};
+    m_dustParticleMaterial.kd_ns = simd::float4{0.55f, 0.58f, 0.62f, 4.0f};
+    m_dustParticleMaterial.ks_alpha = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_dustParticleMaterial.uvScale = simd::float2{1.0f, 1.0f};
+    m_dustParticleMaterial.uvSpeed = simd::float2{0.0f, 0.0f};
+    m_dustParticleMaterial.textureFlags = simd::uint4{dustTexturePath.empty() ? 0u : 1u, 0u, 0u, 1u};
+    m_dustParticleMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+    m_dustParticleTexture = dustTexturePath.empty() ? nil : LoadTextureOrNil(dustTexturePath, true);
+}
+
+void MetalRenderer::UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
+{
+    if (!commandBuffer || !m_particleComputePSO ||
+        !m_particleBaseInstanceBuffer || !m_particleInstanceBuffer || m_particleInstanceCount == 0u)
+    {
+        return;
+    }
+
+    m_particleAnimationTime += dt;
+    const float cycleSeconds = fmaxf(m_particleCycleSeconds, 0.001f);
+    const float phase = fmodf(m_particleAnimationTime, cycleSeconds) / cycleSeconds;
+
+    float sphereFactor = 1.0f;
+    if (phase < m_particleCollapsePart)
+    {
+        sphereFactor = 1.0f - SmoothStep01(phase / fmaxf(m_particleCollapsePart, 0.001f));
+    }
+    else
+    {
+        const float explodePhase =
+            (phase - m_particleCollapsePart) / fmaxf(1.0f - m_particleCollapsePart, 0.001f);
+        sphereFactor = 1.0f - powf(1.0f - fmaxf(0.0f, fminf(explodePhase, 1.0f)), 5.0f);
+    }
+
+    ParticleAnimationCB particleCb;
+    particleCb.centerAndFactor =
+        simd::float4{m_particleCenter.x, m_particleCenter.y, m_particleCenter.z, sphereFactor};
+    particleCb.instanceCount = m_particleInstanceCount;
+
+    id<MTLComputeCommandEncoder> computeEnc = [commandBuffer computeCommandEncoder];
+    if (!computeEnc)
+    {
+        return;
+    }
+
+    [computeEnc setComputePipelineState:m_particleComputePSO];
+    [computeEnc setBuffer:m_particleBaseInstanceBuffer offset:0 atIndex:0];
+    [computeEnc setBuffer:m_particleInstanceBuffer offset:0 atIndex:1];
+    [computeEnc setBytes:&particleCb length:sizeof(ParticleAnimationCB) atIndex:2];
+
+    const NSUInteger threadCount = (NSUInteger)m_particleInstanceCount;
+    const NSUInteger maxThreadsPerGroup = m_particleComputePSO.maxTotalThreadsPerThreadgroup;
+    const NSUInteger threadsPerGroup = std::min<NSUInteger>(maxThreadsPerGroup, 256u);
+    [computeEnc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+    [computeEnc endEncoding];
+}
+
+void MetalRenderer::UpdateDustParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
+{
+    if (!commandBuffer || !m_dustComputePSO ||
+        !m_dustBaseInstanceBuffer || !m_dustInstanceBuffer || m_dustParticleInstanceCount == 0u)
+    {
+        return;
+    }
+
+    m_dustAnimationTime += dt;
+
+    DustAnimationCB dustCb;
+    dustCb.centerAndTime =
+        simd::float4{m_dustParticleCenter.x, m_dustParticleCenter.y, m_dustParticleCenter.z, m_dustAnimationTime};
+    dustCb.motionParams =
+        simd::float4{m_dustDriftAmplitude, m_dustDriftSpeed, m_dustSwirlAmplitude, 0.0f};
+    dustCb.instanceCount = m_dustParticleInstanceCount;
+
+    id<MTLComputeCommandEncoder> computeEnc = [commandBuffer computeCommandEncoder];
+    if (!computeEnc)
+    {
+        return;
+    }
+
+    [computeEnc setComputePipelineState:m_dustComputePSO];
+    [computeEnc setBuffer:m_dustBaseInstanceBuffer offset:0 atIndex:0];
+    [computeEnc setBuffer:m_dustInstanceBuffer offset:0 atIndex:1];
+    [computeEnc setBytes:&dustCb length:sizeof(DustAnimationCB) atIndex:2];
+
+    const NSUInteger threadCount = (NSUInteger)m_dustParticleInstanceCount;
+    const NSUInteger maxThreadsPerGroup = m_dustComputePSO.maxTotalThreadsPerThreadgroup;
+    const NSUInteger threadsPerGroup = std::min<NSUInteger>(maxThreadsPerGroup, 256u);
+    [computeEnc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+    [computeEnc endEncoding];
+}
+
 id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path, bool srgb)
 {
     NSError* err = nil;
@@ -997,7 +1284,7 @@ void MetalRenderer::DrawFrame()
 
         CameraCB* cb = (CameraCB*)m_cameraCB.contents;
 
-        const float dt = 0.016f;
+        const float dt = 0.014f;
 
         //без анимации, статическая матрица
         cb->world = matrix_identity_float4x4;
@@ -1107,6 +1394,9 @@ void MetalRenderer::DrawFrame()
         const float tanHalfFovX = tanHalfFovY * aspect;
 
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
+        UpdateParticleAnimation(cmd, dt);
+        UpdateDustParticleAnimation(cmd, dt);
+
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
 
         // Geometry pass: fill the G-buffer.
@@ -1117,6 +1407,11 @@ void MetalRenderer::DrawFrame()
         [enc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
         [enc setFragmentSamplerState:m_sampler atIndex:0];
         [enc setVertexSamplerState:m_sampler atIndex:0];
+
+        [enc setFragmentBuffer:m_appendStructuredBuffer offset:0 atIndex:3];
+        [enc setFragmentBuffer:m_appendCounterBuffer offset:0 atIndex:4];
+        [enc setFragmentBuffer:m_consumeStructuredBuffer offset:0 atIndex:5];
+        [enc setFragmentBuffer:m_consumeCounterBuffer offset:0 atIndex:6];
 
         if (!m_visibleInstances.empty())
         {
@@ -1295,6 +1590,60 @@ void MetalRenderer::DrawFrame()
                                indexBuffer:m_model4PlaneIB
                          indexBufferOffset:0];
             }
+
+            [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        }
+
+        if (m_particleBillboardPSO &&
+            m_particleQuadVB && m_particleQuadIB &&
+            m_particleInstanceBuffer && m_particleQuadIndexCount > 0u && m_particleInstanceCount > 0u)
+        {
+            CameraCB localCb = *cb;
+            localCb.world = matrix_identity_float4x4;
+
+            [enc setRenderPipelineState:m_particleBillboardPSO];
+            [enc setVertexBuffer:m_particleQuadVB offset:0 atIndex:0];
+            [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_particleMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setVertexBuffer:m_particleInstanceBuffer offset:0 atIndex:3];
+            [enc setFragmentBytes:&m_particleMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setVertexTexture:m_blackTex atIndex:0];
+            [enc setFragmentTexture:(m_particleTexture ? m_particleTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentTexture:m_flatNormalTex atIndex:1];
+
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:m_particleQuadIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:m_particleQuadIB
+                     indexBufferOffset:0
+                         instanceCount:m_particleInstanceCount];
+
+            [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        }
+
+        if (m_particleBillboardPSO &&
+            m_particleQuadVB && m_particleQuadIB &&
+            m_dustInstanceBuffer && m_particleQuadIndexCount > 0u && m_dustParticleInstanceCount > 0u)
+        {
+            CameraCB localCb = *cb;
+            localCb.world = matrix_identity_float4x4;
+
+            [enc setRenderPipelineState:m_particleBillboardPSO];
+            [enc setVertexBuffer:m_particleQuadVB offset:0 atIndex:0];
+            [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_dustParticleMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setVertexBuffer:m_dustInstanceBuffer offset:0 atIndex:3];
+            [enc setFragmentBytes:&m_dustParticleMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setVertexTexture:m_blackTex atIndex:0];
+            [enc setFragmentTexture:(m_dustParticleTexture ? m_dustParticleTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentTexture:m_flatNormalTex atIndex:1];
+
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:m_particleQuadIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:m_particleQuadIB
+                     indexBufferOffset:0
+                         instanceCount:m_dustParticleInstanceCount];
 
             [enc setVertexBuffer:m_vb offset:0 atIndex:0];
         }
