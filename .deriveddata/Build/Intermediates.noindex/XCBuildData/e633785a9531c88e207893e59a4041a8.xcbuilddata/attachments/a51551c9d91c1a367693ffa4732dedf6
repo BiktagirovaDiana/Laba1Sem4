@@ -2,9 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>LastAccessedDate</key>
-	<date>2026-04-25T16:25:38Z</date>
-	<key>WorkspacePath</key>
-	<string>/Users/macbook/Documents/GitHub/Laba1Sem4/KG_1.1.xcodeproj</string>
+	<key>com.apple.application-identifier</key>
+	<string></string>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
 </dict>
 </plist>

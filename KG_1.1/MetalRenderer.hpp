@@ -102,6 +102,23 @@ private:
         uint32_t pad2 = 0;
     };
 
+    struct RainAnimationCB
+    {
+        simd::float4 centerAndTime = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 volumeAndSpeed = {1.0f, 1.0f, 0.0f, 0.0f};
+        simd::float4 bounceParams = {1.0f, 1.0f, 0.0f, 0.0f};
+        uint32_t instanceCount = 0;
+        uint32_t collisionPlaneCount = 0;
+        uint32_t pad0 = 0;
+        uint32_t pad1 = 0;
+    };
+
+    struct RainCollisionPlaneGPU
+    {
+        simd::float4 minXZMaxXZ = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 yAndPadding = {0.0f, 0.0f, 0.0f, 0.0f};
+    };
+
     struct ParticleInstanceGPU
     {
         simd::float4 baseCenterAndSize = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -120,6 +137,7 @@ private:
     id<MTLRenderPipelineState> m_lightingPSO = nil;
     id<MTLComputePipelineState> m_particleComputePSO = nil;
     id<MTLComputePipelineState> m_dustComputePSO = nil;
+    id<MTLComputePipelineState> m_rainComputePSO = nil;
     id<MTLDepthStencilState>   m_dss = nil;
     id<MTLTexture>             m_whiteTex = nil;
     id<MTLTexture>             m_blackTex = nil;
@@ -139,6 +157,9 @@ private:
     id<MTLBuffer> m_particleInstanceBuffer = nil;
     id<MTLBuffer> m_dustBaseInstanceBuffer = nil;
     id<MTLBuffer> m_dustInstanceBuffer = nil;
+    id<MTLBuffer> m_rainBaseInstanceBuffer = nil;
+    id<MTLBuffer> m_rainInstanceBuffer = nil;
+    id<MTLBuffer> m_rainCollisionPlaneBuffer = nil;
     id<MTLBuffer> m_appendStructuredBuffer = nil;
     id<MTLBuffer> m_appendCounterBuffer = nil;
     id<MTLBuffer> m_consumeStructuredBuffer = nil;
@@ -148,6 +169,8 @@ private:
     uint32_t m_particleQuadIndexCount = 0;
     uint32_t m_particleInstanceCount = 0;
     uint32_t m_dustParticleInstanceCount = 0;
+    uint32_t m_rainParticleInstanceCount = 0;
+    uint32_t m_rainCollisionPlaneCount = 0;
     std::vector<VertexPNT> m_cpuVertices;
     std::vector<uint32_t> m_cpuIndices;
     std::vector<CollisionTriangle> m_collisionTriangles;
@@ -167,6 +190,7 @@ private:
     id<MTLTexture> m_model4PlaneTexture = nil;
     id<MTLTexture> m_particleTexture = nil;
     id<MTLTexture> m_dustParticleTexture = nil;
+    id<MTLTexture> m_rainParticleTexture = nil;
     simd::float3 m_camPos = { 0.0f, 0.0f, 3.0f };
     float        m_camSpeed = 120.0f; // units/sec
     
@@ -217,6 +241,17 @@ private:
     float m_dustDriftSpeed = 0.22f;
     float m_dustSwirlAmplitude = 2.5f;
     MaterialGPU m_dustParticleMaterial;
+    uint32_t m_rainParticlePlaneCount = 1400;
+    float m_rainParticleRadius = 75.0f;
+    float m_rainParticlePlaneSize = 0.4f;
+    simd::float3 m_rainParticleCenter = {0.0f, 70.0f, 0.0f};
+    float m_rainAnimationTime = 0.0f;
+    float m_rainFallHeight = 150.0f;
+    float m_rainFallSpeed = 42.0f;
+    float m_rainBounceHeight = 2.4f;
+    float m_rainBounceDistance = 6.5f;
+    float m_rainCollisionBias = 5.75f;
+    MaterialGPU m_rainParticleMaterial;
     std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f};
     std::vector<simd::float3> m_modelOffsets =
     {
@@ -233,8 +268,11 @@ private:
     void CreateStructuredBuffers();
     void CreateParticleResources();
     void CreateDustParticleResources();
+    void CreateRainParticleResources();
+    void BuildRainCollisionPlanes();
     void UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt);
     void UpdateDustParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt);
+    void UpdateRainParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt);
     void LoadObjMesh();
     void CreateModel4PlaneResources();
     void CreateSamplerAndFallbackTexture();

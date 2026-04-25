@@ -433,6 +433,7 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateModel4PlaneResources();
     CreateParticleResources();
     CreateDustParticleResources();
+    CreateRainParticleResources();
     m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
     m_camSpeed = 120.0f;
     m_yaw = (float)M_PI;
@@ -646,6 +647,10 @@ void MetalRenderer::CreateShadersAndPSO()
     id<MTLFunction> dustCompute = [lib newFunctionWithName:@"cs_update_dust_particles"];
     m_dustComputePSO = [m_device newComputePipelineStateWithFunction:dustCompute error:&err];
     if (!m_dustComputePSO) { NSLog(@"Dust particle compute PSO error: %@", err); }
+
+    id<MTLFunction> rainCompute = [lib newFunctionWithName:@"cs_update_rain_particles"];
+    m_rainComputePSO = [m_device newComputePipelineStateWithFunction:rainCompute error:&err];
+    if (!m_rainComputePSO) { NSLog(@"Rain particle compute PSO error: %@", err); }
 }
 
 void MetalRenderer::CreateConstantBuffer()
@@ -923,6 +928,7 @@ void MetalRenderer::LoadObjMesh()
         m_meshRadius = 1.0f;
     }
 
+    BuildRainCollisionPlanes();
     BuildSceneBVH();
 
     m_vb = [m_device newBufferWithBytes:m_cpuVertices.data()
@@ -932,6 +938,40 @@ void MetalRenderer::LoadObjMesh()
     m_ib = [m_device newBufferWithBytes:m_cpuIndices.data()
                                  length:m_cpuIndices.size() * sizeof(uint32_t)
                                 options:MTLResourceStorageModeShared];
+}
+
+void MetalRenderer::BuildRainCollisionPlanes()
+{
+    std::vector<RainCollisionPlaneGPU> planes;
+    planes.reserve(m_sceneInstances.size());
+
+    for (const SceneInstance& instance : m_sceneInstances)
+    {
+        const float minX = instance.worldAabbMin.x;
+        const float minZ = instance.worldAabbMin.z;
+        const float maxX = instance.worldAabbMax.x;
+        const float maxZ = instance.worldAabbMax.z;
+        const float topY = instance.worldAabbMax.y;
+
+        if ((maxX - minX) < 0.05f || (maxZ - minZ) < 0.05f)
+        {
+            continue;
+        }
+
+        RainCollisionPlaneGPU plane;
+        plane.minXZMaxXZ = simd::float4{minX, minZ, maxX, maxZ};
+        plane.yAndPadding = simd::float4{topY, 0.0f, 0.0f, 0.0f};
+        planes.push_back(plane);
+    }
+
+    m_rainCollisionPlaneCount = (uint32_t)planes.size();
+    m_rainCollisionPlaneBuffer = nil;
+    if (!planes.empty())
+    {
+        m_rainCollisionPlaneBuffer = [m_device newBufferWithBytes:planes.data()
+                                                           length:planes.size() * sizeof(RainCollisionPlaneGPU)
+                                                          options:MTLResourceStorageModeShared];
+    }
 }
 
 void MetalRenderer::CreateModel4PlaneResources()
@@ -1038,7 +1078,8 @@ void MetalRenderer::CreateDustParticleResources()
     Particle dustParticles(m_dustParticlePlaneCount,
                            m_dustParticleRadius,
                            m_dustParticlePlaneSize,
-                           m_dustParticleCenter);
+                           m_dustParticleCenter,
+                           Particle::VolumeShape::Cube);
     ObjMesh dustMesh = dustParticles.CreateMesh();
 
     std::vector<ParticleInstanceGPU> instances;
@@ -1084,6 +1125,61 @@ void MetalRenderer::CreateDustParticleResources()
     m_dustParticleMaterial.textureFlags = simd::uint4{dustTexturePath.empty() ? 0u : 1u, 0u, 0u, 1u};
     m_dustParticleMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
     m_dustParticleTexture = dustTexturePath.empty() ? nil : LoadTextureOrNil(dustTexturePath, true);
+}
+
+void MetalRenderer::CreateRainParticleResources()
+{
+    const std::string rainTexturePath = ResolveAssetPath("Particle3.png");
+    Particle rainParticles(m_rainParticlePlaneCount,
+                           m_rainParticleRadius,
+                           m_rainParticlePlaneSize,
+                           m_rainParticleCenter,
+                           Particle::VolumeShape::Cube);
+    ObjMesh rainMesh = rainParticles.CreateMesh();
+
+    std::vector<ParticleInstanceGPU> instances;
+    instances.reserve(rainMesh.vertices.size() / 4u);
+    for (size_t i = 0; i + 3 < rainMesh.vertices.size(); i += 4)
+    {
+        const VertexPNT& v0 = rainMesh.vertices[i + 0];
+        const VertexPNT& v1 = rainMesh.vertices[i + 1];
+        const VertexPNT& v2 = rainMesh.vertices[i + 2];
+        const VertexPNT& v3 = rainMesh.vertices[i + 3];
+        const simd::float3 center =
+            (simd::float3{v0.px, v0.py, v0.pz} +
+             simd::float3{v1.px, v1.py, v1.pz} +
+             simd::float3{v2.px, v2.py, v2.pz} +
+             simd::float3{v3.px, v3.py, v3.pz}) * 0.25f;
+        const float width = simd::distance(simd::float3{v0.px, v0.py, v0.pz},
+                                           simd::float3{v1.px, v1.py, v1.pz});
+        const float height = simd::distance(simd::float3{v1.px, v1.py, v1.pz},
+                                            simd::float3{v2.px, v2.py, v2.pz});
+
+        ParticleInstanceGPU instance;
+        instance.baseCenterAndSize = simd::float4{center.x, center.y, center.z, fmaxf(fmaxf(width, height), 0.001f)};
+        instance.animatedCenterAndSeed = simd::float4{center.x, center.y, center.z, (float)instances.size()};
+        instances.push_back(instance);
+    }
+
+    m_rainParticleInstanceCount = (uint32_t)instances.size();
+    if (!instances.empty())
+    {
+        m_rainBaseInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                         length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                        options:MTLResourceStorageModeShared];
+        m_rainInstanceBuffer = [m_device newBufferWithBytes:instances.data()
+                                                     length:instances.size() * sizeof(ParticleInstanceGPU)
+                                                    options:MTLResourceStorageModeShared];
+    }
+
+    m_rainParticleMaterial = {};
+    m_rainParticleMaterial.kd_ns = simd::float4{0.72f, 0.82f, 0.96f, 6.0f};
+    m_rainParticleMaterial.ks_alpha = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_rainParticleMaterial.uvScale = simd::float2{1.0f, 1.0f};
+    m_rainParticleMaterial.uvSpeed = simd::float2{0.0f, 0.0f};
+    m_rainParticleMaterial.textureFlags = simd::uint4{rainTexturePath.empty() ? 0u : 1u, 0u, 0u, 1u};
+    m_rainParticleMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+    m_rainParticleTexture = rainTexturePath.empty() ? nil : LoadTextureOrNil(rainTexturePath, true);
 }
 
 void MetalRenderer::UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
@@ -1164,6 +1260,53 @@ void MetalRenderer::UpdateDustParticleAnimation(id<MTLCommandBuffer> commandBuff
 
     const NSUInteger threadCount = (NSUInteger)m_dustParticleInstanceCount;
     const NSUInteger maxThreadsPerGroup = m_dustComputePSO.maxTotalThreadsPerThreadgroup;
+    const NSUInteger threadsPerGroup = std::min<NSUInteger>(maxThreadsPerGroup, 256u);
+    [computeEnc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+    [computeEnc endEncoding];
+}
+
+void MetalRenderer::UpdateRainParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
+{
+    if (!commandBuffer || !m_rainComputePSO ||
+        !m_rainBaseInstanceBuffer || !m_rainInstanceBuffer || m_rainParticleInstanceCount == 0u)
+    {
+        return;
+    }
+
+    m_rainAnimationTime += dt;
+
+    RainAnimationCB rainCb;
+    rainCb.centerAndTime =
+        simd::float4{m_rainParticleCenter.x, m_rainParticleCenter.y, m_rainParticleCenter.z, m_rainAnimationTime};
+    rainCb.volumeAndSpeed =
+        simd::float4{m_rainParticleRadius, m_rainFallHeight, m_rainFallSpeed, 0.0f};
+    rainCb.bounceParams =
+        simd::float4{m_rainBounceHeight, m_rainBounceDistance, m_rainCollisionBias, 0.0f};
+    rainCb.instanceCount = m_rainParticleInstanceCount;
+    rainCb.collisionPlaneCount = m_rainCollisionPlaneCount;
+
+    id<MTLComputeCommandEncoder> computeEnc = [commandBuffer computeCommandEncoder];
+    if (!computeEnc)
+    {
+        return;
+    }
+
+    [computeEnc setComputePipelineState:m_rainComputePSO];
+    [computeEnc setBuffer:m_rainBaseInstanceBuffer offset:0 atIndex:0];
+    [computeEnc setBuffer:m_rainInstanceBuffer offset:0 atIndex:1];
+    [computeEnc setBytes:&rainCb length:sizeof(RainAnimationCB) atIndex:2];
+    if (m_rainCollisionPlaneBuffer && m_rainCollisionPlaneCount > 0u)
+    {
+        [computeEnc setBuffer:m_rainCollisionPlaneBuffer offset:0 atIndex:3];
+    }
+    else
+    {
+        [computeEnc setBuffer:nil offset:0 atIndex:3];
+    }
+
+    const NSUInteger threadCount = (NSUInteger)m_rainParticleInstanceCount;
+    const NSUInteger maxThreadsPerGroup = m_rainComputePSO.maxTotalThreadsPerThreadgroup;
     const NSUInteger threadsPerGroup = std::min<NSUInteger>(maxThreadsPerGroup, 256u);
     [computeEnc dispatchThreads:MTLSizeMake(threadCount, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
@@ -1396,6 +1539,7 @@ void MetalRenderer::DrawFrame()
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         UpdateParticleAnimation(cmd, dt);
         UpdateDustParticleAnimation(cmd, dt);
+        UpdateRainParticleAnimation(cmd, dt);
 
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
 
@@ -1644,6 +1788,33 @@ void MetalRenderer::DrawFrame()
                            indexBuffer:m_particleQuadIB
                      indexBufferOffset:0
                          instanceCount:m_dustParticleInstanceCount];
+
+            [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        }
+
+        if (m_particleBillboardPSO &&
+            m_particleQuadVB && m_particleQuadIB &&
+            m_rainInstanceBuffer && m_particleQuadIndexCount > 0u && m_rainParticleInstanceCount > 0u)
+        {
+            CameraCB localCb = *cb;
+            localCb.world = matrix_identity_float4x4;
+
+            [enc setRenderPipelineState:m_particleBillboardPSO];
+            [enc setVertexBuffer:m_particleQuadVB offset:0 atIndex:0];
+            [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_rainParticleMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setVertexBuffer:m_rainInstanceBuffer offset:0 atIndex:3];
+            [enc setFragmentBytes:&m_rainParticleMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setVertexTexture:m_blackTex atIndex:0];
+            [enc setFragmentTexture:(m_rainParticleTexture ? m_rainParticleTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentTexture:m_flatNormalTex atIndex:1];
+
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:m_particleQuadIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:m_particleQuadIB
+                     indexBufferOffset:0
+                         instanceCount:m_rainParticleInstanceCount];
 
             [enc setVertexBuffer:m_vb offset:0 atIndex:0];
         }

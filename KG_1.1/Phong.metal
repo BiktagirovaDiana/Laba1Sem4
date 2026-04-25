@@ -65,6 +65,23 @@ struct DustAnimationCB
     uint pad2;
 };
 
+struct RainAnimationCB
+{
+    float4 centerAndTime;
+    float4 volumeAndSpeed;
+    float4 bounceParams;
+    uint instanceCount;
+    uint collisionPlaneCount;
+    uint pad0;
+    uint pad1;
+};
+
+struct RainCollisionPlane
+{
+    float4 minXZMaxXZ;
+    float4 yAndPadding;
+};
+
 struct ParticleInstance
 {
     float4 baseCenterAndSize;
@@ -139,6 +156,82 @@ kernel void cs_update_dust_particles(const device ParticleInstance* baseInstance
 
     ParticleInstance animatedInstance = baseInstance;
     animatedInstance.animatedCenterAndSeed.xyz = baseCenter + offset;
+    animatedInstances[instanceId] = animatedInstance;
+}
+
+kernel void cs_update_rain_particles(const device ParticleInstance* baseInstances [[buffer(0)]],
+                                     device ParticleInstance* animatedInstances [[buffer(1)]],
+                                     constant RainAnimationCB& cb [[buffer(2)]],
+                                     const device RainCollisionPlane* collisionPlanes [[buffer(3)]],
+                                     uint instanceId [[thread_position_in_grid]])
+{
+    if (instanceId >= cb.instanceCount)
+    {
+        return;
+    }
+
+    const ParticleInstance baseInstance = baseInstances[instanceId];
+    const float3 center = cb.centerAndTime.xyz;
+    const float time = cb.centerAndTime.w;
+    const float radius = cb.volumeAndSpeed.x;
+    const float fallHeight = max(cb.volumeAndSpeed.y, 0.001);
+    const float fallSpeed = cb.volumeAndSpeed.z;
+    const float bounceHeight = max(cb.bounceParams.x, 0.0);
+    const float respawnDistance = max(cb.bounceParams.y, 0.0);
+    const float collisionBias = max(cb.bounceParams.z, 0.0);
+    const float topY = center.y + radius;
+    const float2 xz = baseInstance.baseCenterAndSize.xz;
+    const float particleVisualLift = max(baseInstance.baseCenterAndSize.w, 0.001);
+    const float startOffset = clamp(topY - baseInstance.baseCenterAndSize.y, 0.0, fallHeight);
+
+    float collisionY = topY - fallHeight;
+    for (uint i = 0; i < cb.collisionPlaneCount; ++i)
+    {
+        const RainCollisionPlane plane = collisionPlanes[i];
+        const float4 bounds = plane.minXZMaxXZ;
+        if (xz.x < bounds.x || xz.x > bounds.z || xz.y < bounds.y || xz.y > bounds.w)
+        {
+            continue;
+        }
+
+        const float candidateY = plane.yAndPadding.x;
+        if (candidateY < topY && candidateY > collisionY)
+        {
+            collisionY = candidateY;
+        }
+    }
+
+    collisionY += particleVisualLift + collisionBias;
+    collisionY = min(collisionY, topY);
+
+    const float impactDistance = clamp(topY - collisionY, 0.0, fallHeight);
+    const float safeFallSpeed = max(fallSpeed, 0.001);
+    const float fallDuration = impactDistance / safeFallSpeed;
+    const float bounceDuration = (bounceHeight > 0.0)
+        ? max(respawnDistance / safeFallSpeed, 0.06)
+        : 0.0;
+    const float respawnDelay = max(respawnDistance / safeFallSpeed, 0.0);
+    const float cycleDuration = max(fallDuration + bounceDuration + respawnDelay, 0.001);
+    const float cycleTime = fmod(startOffset / safeFallSpeed + time, cycleDuration);
+
+    float3 animatedCenter = baseInstance.baseCenterAndSize.xyz;
+    if (cycleTime < fallDuration)
+    {
+        animatedCenter.y = topY - cycleTime * safeFallSpeed;
+    }
+    else if (cycleTime < fallDuration + bounceDuration)
+    {
+        const float bounceTime = (cycleTime - fallDuration) / max(bounceDuration, 0.001);
+        const float bounceArc = 1.0 - pow(2.0 * bounceTime - 1.0, 2.0);
+        animatedCenter.y = collisionY + bounceHeight * max(bounceArc, 0.0);
+    }
+    else
+    {
+        animatedCenter = float3(xz.x, collisionY - fallHeight - bounceHeight - 10.0, xz.y);
+    }
+
+    ParticleInstance animatedInstance = baseInstance;
+    animatedInstance.animatedCenterAndSeed.xyz = animatedCenter;
     animatedInstances[instanceId] = animatedInstance;
 }
 

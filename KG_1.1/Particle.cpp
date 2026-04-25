@@ -18,16 +18,24 @@ simd::float3 RandomUnitVector(std::mt19937& rng)
 
     return simd::float3{cosf(angle) * xyRadius, sinf(angle) * xyRadius, z};
 }
+
+simd::float3 RandomPointInCube(std::mt19937& rng, float radius)
+{
+    std::uniform_real_distribution<float> axisDist(-radius, radius);
+    return simd::float3{axisDist(rng), axisDist(rng), axisDist(rng)};
+}
 }
 
 Particle::Particle(uint32_t planeCount,
                    float radius,
                    float planeSize,
-                   simd::float3 center)
+                   simd::float3 center,
+                   VolumeShape volumeShape)
     : m_planeCount(planeCount),
       m_radius(radius),
       m_planeSize(planeSize),
-      m_center(center)
+      m_center(center),
+      m_volumeShape(volumeShape)
 {
 }
 
@@ -50,10 +58,17 @@ ObjMesh Particle::CreateMesh() const
 
     for (uint32_t i = 0; i < m_planeCount; ++i)
     {
-        const simd::float3 sphereDirection = RandomUnitVector(rng);
-        const float distance = cbrtf(unitDist(rng)) * radius;
-        const simd::float3 planeCenter =
-            m_center + sphereDirection * distance;
+        simd::float3 planeCenter = m_center;
+        if (m_volumeShape == VolumeShape::Cube)
+        {
+            planeCenter += RandomPointInCube(rng, radius);
+        }
+        else
+        {
+            const simd::float3 sphereDirection = RandomUnitVector(rng);
+            const float distance = cbrtf(unitDist(rng)) * radius;
+            planeCenter += sphereDirection * distance;
+        }
 
         const simd::float3 normal = RandomUnitVector(rng);
         const simd::float3 axisHint =
