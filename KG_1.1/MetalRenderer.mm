@@ -40,6 +40,28 @@ static inline simd_float4x4 MatRotationY(float a)
     return m;
 }
 
+static inline simd_float4x4 MatRotationX(float a)
+{
+    const float c = cosf(a);
+    const float s = sinf(a);
+
+    simd_float4x4 m = MatIdentity();
+    m.columns[1] = (simd_float4){ 0.0f,  c, s, 0.0f };
+    m.columns[2] = (simd_float4){ 0.0f, -s, c, 0.0f };
+    return m;
+}
+
+static inline simd_float4x4 MatRotationZ(float a)
+{
+    const float c = cosf(a);
+    const float s = sinf(a);
+
+    simd_float4x4 m = MatIdentity();
+    m.columns[0] = (simd_float4){  c, s, 0.0f, 0.0f };
+    m.columns[1] = (simd_float4){ -s, c, 0.0f, 0.0f };
+    return m;
+}
+
 static inline simd_float4x4 MatLookAtRH(simd_float3 eye, simd_float3 at, simd_float3 up)
 {
     simd_float3 z = simd_normalize(eye - at);
@@ -450,6 +472,7 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateParticleResources();
     CreateDustParticleResources();
     CreateRainParticleResources();
+    CreateFencePlaneResources();
     m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
     m_camSpeed = 120.0f;
     m_yaw = (float)M_PI;
@@ -655,6 +678,34 @@ void MetalRenderer::CreateShadersAndPSO()
 
     m_shadowPSO = [m_device newRenderPipelineStateWithDescriptor:shadowDesc error:&err];
     if (!m_shadowPSO) { NSLog(@"Shadow PSO error: %@", err); }
+
+    // Fence: gbuffer PSO (alpha-test, two-sided normals are fine for a flat plane)
+    id<MTLFunction> vsFenceGbuf = [lib newFunctionWithName:@"vs_fence_gbuffer"];
+    id<MTLFunction> psFenceGbuf = [lib newFunctionWithName:@"ps_fence_gbuffer"];
+    MTLRenderPipelineDescriptor* fenceGbufDesc = [MTLRenderPipelineDescriptor new];
+    fenceGbufDesc.vertexFunction = vsFenceGbuf;
+    fenceGbufDesc.fragmentFunction = psFenceGbuf;
+    fenceGbufDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    fenceGbufDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
+    fenceGbufDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
+    fenceGbufDesc.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
+    fenceGbufDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    fenceGbufDesc.vertexDescriptor = vd;
+
+    m_fenceGbufferPSO = [m_device newRenderPipelineStateWithDescriptor:fenceGbufDesc error:&err];
+    if (!m_fenceGbufferPSO) { NSLog(@"Fence GBuffer PSO error: %@", err); }
+
+    // Fence: shadow PSO (alpha-test via fragment shader)
+    id<MTLFunction> vsFenceShadow = [lib newFunctionWithName:@"vs_fence_shadow"];
+    id<MTLFunction> psFenceShadow = [lib newFunctionWithName:@"ps_fence_shadow"];
+    MTLRenderPipelineDescriptor* fenceShadowDesc = [MTLRenderPipelineDescriptor new];
+    fenceShadowDesc.vertexFunction = vsFenceShadow;
+    fenceShadowDesc.fragmentFunction = psFenceShadow;
+    fenceShadowDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    fenceShadowDesc.vertexDescriptor = vd;
+
+    m_fenceShadowPSO = [m_device newRenderPipelineStateWithDescriptor:fenceShadowDesc error:&err];
+    if (!m_fenceShadowPSO) { NSLog(@"Fence Shadow PSO error: %@", err); }
 
     id<MTLFunction> vsParticleBillboard = [lib newFunctionWithName:@"vs_particle_billboard"];
     MTLRenderPipelineDescriptor* particleDesc = [MTLRenderPipelineDescriptor new];
@@ -1226,6 +1277,51 @@ void MetalRenderer::CreateRainParticleResources()
     m_rainParticleTexture = rainTexturePath.empty() ? nil : LoadTextureOrNil(rainTexturePath, true);
 }
 
+// ── Fence plane ───────────────────────────────────────────────────────────────
+void MetalRenderer::CreateFencePlaneResources()
+{
+    // Resolve texture: look for realistic-steel-fence.png (with or without alpha channel).
+    const std::string texPath = ResolveAssetPath("realistic-steel-fence.png");
+    if (texPath.empty())
+    {
+        NSLog(@"[Fence] Texture 'realistic-steel-fence.png' not found in assets.");
+    }
+    m_fenceTexture = texPath.empty() ? nil : LoadTextureOrNil(texPath, /*srgb=*/true);
+
+    // Build a simple quad in the XY plane (–0.5..+0.5) that will be scaled
+    // by m_fenceSize in the world matrix.  UVs cover [0,1]×[0,1] so the full
+    // texture is displayed once.
+    //
+    // Layout: VertexPNT = { px py pz  nx ny nz  u v }
+    const std::vector<VertexPNT> verts =
+    {
+        //  pos                  normal           uv
+        { -0.5f, -0.5f, 0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 1.0f },
+        {  0.5f, -0.5f, 0.0f,  0.0f, 0.0f, 1.0f,  1.0f, 1.0f },
+        {  0.5f,  0.5f, 0.0f,  0.0f, 0.0f, 1.0f,  1.0f, 0.0f },
+        { -0.5f,  0.5f, 0.0f,  0.0f, 0.0f, 1.0f,  0.0f, 0.0f },
+    };
+    const std::vector<uint32_t> indices = { 0u, 1u, 2u,  0u, 2u, 3u };
+    m_fenceIndexCount = (uint32_t)indices.size();
+
+    m_fenceVB = [m_device newBufferWithBytes:verts.data()
+                                      length:verts.size() * sizeof(VertexPNT)
+                                     options:MTLResourceStorageModeShared];
+    m_fenceIB = [m_device newBufferWithBytes:indices.data()
+                                      length:indices.size() * sizeof(uint32_t)
+                                     options:MTLResourceStorageModeShared];
+
+    // Material: full white diffuse, mild specular.
+    m_fenceMaterial = {};
+    m_fenceMaterial.kd_ns      = simd::float4{1.0f, 1.0f, 1.0f, 32.0f};
+    m_fenceMaterial.ks_alpha   = simd::float4{0.05f, 0.05f, 0.05f, 1.0f};
+    m_fenceMaterial.uvScale    = simd::float2{1.0f, 1.0f};
+    m_fenceMaterial.uvSpeed    = simd::float2{0.0f, 0.0f};
+    // textureFlags.x=1 → has diffuse; .w=0 → not a plane-replacement sprite
+    m_fenceMaterial.textureFlags = simd::uint4{m_fenceTexture ? 1u : 0u, 0u, 0u, 0u};
+    m_fenceMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+}
+
 void MetalRenderer::UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
 {
     if (!commandBuffer || !m_particleComputePSO ||
@@ -1445,6 +1541,20 @@ static simd::float4x4 RotationY(float a)
     m.columns[0] = { c, 0, -s, 0 };
     m.columns[2] = { s, 0,  c, 0 };
     return m;
+}
+
+
+static inline simd_float4x4 FenceWorldMatrix(simd::float3 pos,
+                                              simd::float2 size,
+                                              float yaw, float pitch, float roll)
+{
+    simd_float4x4 scaleM = matrix_identity_float4x4;
+    scaleM.columns[0].x = size.x;
+    scaleM.columns[1].y = size.y;
+    const simd_float4x4 rot = simd_mul(simd_mul(MatRotationY(yaw),
+                                                 MatRotationX(pitch)),
+                                        MatRotationZ(roll));
+    return simd_mul(simd_mul(MatTranslation(pos), rot), scaleM);
 }
 
 void MetalRenderer::DrawFrame()
@@ -1821,12 +1931,70 @@ void MetalRenderer::DrawFrame()
                                        indexBufferOffset:(NSUInteger)b.indexOffset * sizeof(uint32_t)];
                     }
 
+                    // ── Fence: simple geometry shadow ────────────────────
+                    if (m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+                    {
+                        CameraCB fenceShadowCb = *cb;
+                        fenceShadowCb.view  = lightView;
+                        fenceShadowCb.proj  = lightProj;
+                        fenceShadowCb.world = FenceWorldMatrix(m_fencePosition, m_fenceSize,
+                                                               m_fenceYawRadians,
+                                                               m_fencePitchRadians,
+                                                               m_fenceRollRadians);
+
+                        MaterialGPU fenceShadowMat = m_fenceMaterial;
+                        fenceShadowMat.detailParams.x = 0.0f;
+
+                        [shadowEnc setCullMode:MTLCullModeNone];
+                        [shadowEnc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
+                        [shadowEnc setVertexBytes:&fenceShadowCb length:sizeof(CameraCB) atIndex:1];
+                        [shadowEnc setVertexBytes:&fenceShadowMat length:sizeof(MaterialGPU) atIndex:2];
+                        [shadowEnc setVertexTexture:m_blackTex atIndex:0];
+
+                        [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:m_fenceIndexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:m_fenceIB
+                                       indexBufferOffset:0];
+                        [shadowEnc setCullMode:MTLCullModeBack];
+                        [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
+                    }
+
+                    // ── Fence 2: simple geometry shadow ───────────────────
+                    if (m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+                    {
+                        CameraCB fence2ShadowCb = *cb;
+                        fence2ShadowCb.view  = lightView;
+                        fence2ShadowCb.proj  = lightProj;
+                        fence2ShadowCb.world = FenceWorldMatrix(m_fence2Position, m_fence2Size,
+                                                                m_fence2YawRadians,
+                                                                m_fence2PitchRadians,
+                                                                m_fence2RollRadians);
+
+                        MaterialGPU fence2ShadowMat = m_fenceMaterial;
+                        fence2ShadowMat.detailParams.x = 0.0f;
+
+                        [shadowEnc setCullMode:MTLCullModeNone];
+                        [shadowEnc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
+                        [shadowEnc setVertexBytes:&fence2ShadowCb length:sizeof(CameraCB) atIndex:1];
+                        [shadowEnc setVertexBytes:&fence2ShadowMat length:sizeof(MaterialGPU) atIndex:2];
+                        [shadowEnc setVertexTexture:m_blackTex atIndex:0];
+
+                        [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:m_fenceIndexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:m_fenceIB
+                                       indexBufferOffset:0];
+                        [shadowEnc setCullMode:MTLCullModeBack];
+                        [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
+                    }
+
                     [shadowEnc endEncoding];
-                }
+                } // if (shadowEnc)
 
                 cascadeNear = cascadeFar;
-            }
-        }
+            } // for cascadeIndex
+        } // if (m_enableCascadedShadows)
 
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
 
@@ -2023,6 +2191,62 @@ void MetalRenderer::DrawFrame()
                          instanceCount:m_rainParticleInstanceCount];
 
             [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        }
+
+        // ── Fence plane: GBuffer pass ─────────────────────────────────────────
+        if (m_fenceGbufferPSO && m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+        {
+            CameraCB fenceCb = *cb;
+            fenceCb.world = FenceWorldMatrix(m_fencePosition, m_fenceSize,
+                                             m_fenceYawRadians,
+                                             m_fencePitchRadians,
+                                             m_fenceRollRadians);
+
+            [enc setRenderPipelineState:m_fenceGbufferPSO];
+            [enc setCullMode:MTLCullModeNone]; // render both sides
+            [enc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
+            [enc setVertexBytes:&fenceCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setFragmentBytes:&fenceCb length:sizeof(CameraCB) atIndex:0];
+            [enc setFragmentBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setFragmentTexture:(m_fenceTexture ? m_fenceTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentSamplerState:m_sampler atIndex:0];
+
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:m_fenceIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:m_fenceIB
+                     indexBufferOffset:0];
+
+            // Restore default cull mode and pipeline for anything that follows.
+            [enc setCullMode:MTLCullModeBack];
+        }
+
+        // ── Fence 2: GBuffer pass ─────────────────────────────────────────
+        if (m_fenceGbufferPSO && m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+        {
+            CameraCB fence2Cb = *cb;
+            fence2Cb.world = FenceWorldMatrix(m_fence2Position, m_fence2Size,
+                                              m_fence2YawRadians,
+                                              m_fence2PitchRadians,
+                                              m_fence2RollRadians);
+
+            [enc setRenderPipelineState:m_fenceGbufferPSO];
+            [enc setCullMode:MTLCullModeNone];
+            [enc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
+            [enc setVertexBytes:&fence2Cb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setFragmentBytes:&fence2Cb length:sizeof(CameraCB) atIndex:0];
+            [enc setFragmentBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setFragmentTexture:(m_fenceTexture ? m_fenceTexture : m_whiteTex) atIndex:0];
+            [enc setFragmentSamplerState:m_sampler atIndex:0];
+
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:m_fenceIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:m_fenceIB
+                     indexBufferOffset:0];
+            [enc setCullMode:MTLCullModeBack];
         }
 
         [enc endEncoding];

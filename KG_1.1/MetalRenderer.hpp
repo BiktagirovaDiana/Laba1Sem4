@@ -142,6 +142,8 @@ private:
 
     id<MTLRenderPipelineState> m_gbufferPSO = nil;
     id<MTLRenderPipelineState> m_shadowPSO = nil;
+    id<MTLRenderPipelineState> m_fenceGbufferPSO = nil;
+    id<MTLRenderPipelineState> m_fenceShadowPSO = nil;
     id<MTLRenderPipelineState> m_particleBillboardPSO = nil;
     id<MTLRenderPipelineState> m_lightingPSO = nil;
     id<MTLComputePipelineState> m_particleComputePSO = nil;
@@ -212,7 +214,7 @@ private:
     float m_prevMouseY = 0.0f;
     bool  m_mouseInit  = false;
 
-    float m_mouseSens  = 0.0025f; 
+    float m_mouseSens  = 0.0025f;
     float m_timeSeconds = 0.0f;
     simd::float2 m_textureTiling = {2.0f, 2.0f};
     simd::float2 m_textureScrollSpeed = {0.08f, 0.0f};
@@ -276,6 +278,27 @@ private:
         simd::float3{50.0f, 0.0f, 0.0f}
     };
 
+    id<MTLBuffer>  m_fenceVB = nil;
+    id<MTLBuffer>  m_fenceIB = nil;
+    uint32_t       m_fenceIndexCount = 0;
+    id<MTLTexture> m_fenceTexture = nil;
+    MaterialGPU    m_fenceMaterial;
+
+    // Plane 1
+    simd::float3   m_fencePosition    = {0.0f, 0.0f, -125.0f};
+    simd::float2   m_fenceSize        = {40.0f, 12.0f};
+    float          m_fenceYawRadians   = 0.0f;
+    float          m_fencePitchRadians = 0.0f;
+    float          m_fenceRollRadians  = 0.0f;
+
+    // Plane 2
+    simd::float3   m_fence2Position    = {0.0f, 0.0f, -125.0f};
+    simd::float2   m_fence2Size        = {40.0f, 12.0f};
+    float          m_fence2YawRadians   = 0.0f;
+    float          m_fence2PitchRadians = 0.0f;
+    float          m_fence2RollRadians  = 0.0f;
+
+    void CreateFencePlaneResources();
     void CreateDeviceAndSwapchain();
     void CreateDepth();
     void CreateShadowResources();

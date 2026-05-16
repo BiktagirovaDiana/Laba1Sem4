@@ -333,6 +333,71 @@ vertex float4 vs_shadow(VertexIn vin [[stage_in]],
     return cb.proj * cb.view * wp;
 }
 
+// ── Fence plane: shadow pass with alpha-test ──────────────────────────────────
+// VSOut is reused — we need uv in the fragment stage.
+struct FenceShadowVSOut
+{
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex FenceShadowVSOut vs_fence_shadow(VertexIn vin [[stage_in]],
+                                        constant CameraCB& cb [[buffer(1)]],
+                                        constant MaterialCB& mat [[buffer(2)]])
+{
+    const float4 wp = cb.world * float4(vin.position, 1.0);
+    FenceShadowVSOut o;
+    o.position = cb.proj * cb.view * wp;
+    o.uv = vin.uv * mat.uvScale;
+    return o;
+}
+
+fragment void ps_fence_shadow(FenceShadowVSOut in [[stage_in]],
+                              texture2d<float> diffuseTex [[texture(0)]],
+                              sampler linearSampler [[sampler(0)]])
+{
+    const float alpha = diffuseTex.sample(linearSampler, in.uv).a;
+    if (alpha < 0.5)
+    {
+        discard_fragment();
+    }
+}
+
+// ── Fence plane: gbuffer pass ─────────────────────────────────────────────────
+vertex VSOut vs_fence_gbuffer(VertexIn vin [[stage_in]],
+                              constant CameraCB& cb [[buffer(1)]],
+                              constant MaterialCB& mat [[buffer(2)]])
+{
+    const float4 wp = cb.world * float4(vin.position, 1.0);
+    VSOut o;
+    o.position = cb.proj * cb.view * wp;
+    o.worldPos = wp.xyz;
+    o.worldN = normalize((cb.world * float4(vin.normal, 0.0)).xyz);
+    o.uv = vin.uv * mat.uvScale;
+    return o;
+}
+
+fragment GBufferOut ps_fence_gbuffer(VSOut in [[stage_in]],
+                                     constant CameraCB& cb [[buffer(0)]],
+                                     constant MaterialCB& mat [[buffer(1)]],
+                                     texture2d<float> diffuseTex [[texture(0)]],
+                                     sampler linearSampler [[sampler(0)]])
+{
+    const float4 diffuseSample = diffuseTex.sample(linearSampler, in.uv);
+    if (diffuseSample.a < 0.5)
+    {
+        discard_fragment();
+    }
+
+    GBufferOut outData;
+    outData.albedo   = float4(diffuseSample.rgb * mat.kd_ns.rgb, 1.0);
+    outData.normal   = float4(normalize(in.worldN), 1.0);
+    outData.position = float4(in.worldPos, 1.0);
+    // Use standard Phong material channel (non-zero .a → full lighting)
+    outData.material = float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
+    return outData;
+}
+
 vertex VSOut vs_particle_billboard(VertexIn vin [[stage_in]],
                                    constant CameraCB& cb [[buffer(1)]],
                                    constant MaterialCB& mat [[buffer(2)]],
@@ -448,7 +513,7 @@ static float SampleShadowPCF(depth2d<float> shadowMap,
                              float texelSize)
 {
     float lit = 0.0;
-    constexpr int radius = 2;
+    constexpr int radius = 1;
     constexpr float sampleCount = float((radius * 2 + 1) * (radius * 2 + 1));
 
     for (int y = -radius; y <= radius; ++y)
