@@ -28,6 +28,14 @@ struct CameraCB
     float    timeSeconds;
 };
 
+struct ShadowCB
+{
+    float4x4 lightViewProj[4];
+    float4 cascadeSplits;
+    float4 texelSizes;
+    float4 params;
+};
+
 struct MaterialCB
 {
     float4 kd_ns;
@@ -307,6 +315,24 @@ vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
     return o;
 }
 
+vertex float4 vs_shadow(VertexIn vin [[stage_in]],
+                        constant CameraCB& cb [[buffer(1)]],
+                        constant MaterialCB& mat [[buffer(2)]],
+                        texture2d<float> heightTex [[texture(0)]],
+                        sampler linearSampler [[sampler(0)]])
+{
+    const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
+    float3 displacedPosition = vin.position;
+    if (mat.textureFlags.z != 0u)
+    {
+        const float height = heightTex.sample(linearSampler, uv, level(0.0)).r - 0.5;
+        displacedPosition += normalize(vin.normal) * (height * mat.detailParams.x);
+    }
+
+    const float4 wp = cb.world * float4(displacedPosition, 1.0);
+    return cb.proj * cb.view * wp;
+}
+
 vertex VSOut vs_particle_billboard(VertexIn vin [[stage_in]],
                                    constant CameraCB& cb [[buffer(1)]],
                                    constant MaterialCB& mat [[buffer(2)]],
@@ -407,13 +433,49 @@ vertex FullscreenOut vs_fullscreen(uint vid [[vertex_id]])
     return o;
 }
 
+static float SampleShadowMap(depth2d<float> shadowMap,
+                             sampler shadowSampler,
+                             float2 uv,
+                             float compareDepth)
+{
+    return shadowMap.sample_compare(shadowSampler, uv, compareDepth);
+}
+
+static float SampleShadowPCF(depth2d<float> shadowMap,
+                             sampler shadowSampler,
+                             float2 uv,
+                             float compareDepth,
+                             float texelSize)
+{
+    float lit = 0.0;
+    constexpr int radius = 2;
+    constexpr float sampleCount = float((radius * 2 + 1) * (radius * 2 + 1));
+
+    for (int y = -radius; y <= radius; ++y)
+    {
+        for (int x = -radius; x <= radius; ++x)
+        {
+            const float2 offset = float2(float(x), float(y)) * texelSize;
+            lit += SampleShadowMap(shadowMap, shadowSampler, uv + offset, compareDepth);
+        }
+    }
+
+    return lit / sampleCount;
+}
+
 fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                             constant CameraCB& cb [[buffer(0)]],
+                            constant ShadowCB& shadowCb [[buffer(1)]],
                             texture2d<float> gbufferAlbedo [[texture(0)]],
                             texture2d<float> gbufferNormal [[texture(1)]],
                             texture2d<float> gbufferPosition [[texture(2)]],
                             texture2d<float> gbufferMaterial [[texture(3)]],
-                            sampler linearSampler [[sampler(0)]])
+                            depth2d<float> shadowMap0 [[texture(4)]],
+                            depth2d<float> shadowMap1 [[texture(5)]],
+                            depth2d<float> shadowMap2 [[texture(6)]],
+                            depth2d<float> shadowMap3 [[texture(7)]],
+                            sampler linearSampler [[sampler(0)]],
+                            sampler shadowSampler [[sampler(1)]])
 {
     const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
     const float4 albedoSample = gbufferAlbedo.sample(linearSampler, uv);
@@ -441,11 +503,53 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
     const float diff = max(dot(N, L), 0.0);
     const float spec = pow(max(dot(R, V), 0.0), materialSample.a);
     const float3 directionalRadiance = cb.lightColor * cb.lightIntensity;
+    const float viewDepth = -(cb.view * float4(worldPos, 1.0)).z;
+
+    uint cascadeIndex = 0u;
+    if (viewDepth > shadowCb.cascadeSplits.x) cascadeIndex = 1u;
+    if (viewDepth > shadowCb.cascadeSplits.y) cascadeIndex = 2u;
+    if (viewDepth > shadowCb.cascadeSplits.z) cascadeIndex = 3u;
+
+    const float4 lightClip = shadowCb.lightViewProj[cascadeIndex] * float4(worldPos, 1.0);
+    const float3 lightNdc = lightClip.xyz / lightClip.w;
+    const float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 1.0 - (lightNdc.y * 0.5 + 0.5));
+    const float shadowDepth = lightNdc.z;
+    float shadowVisibility = 1.0;
+
+    if (shadowCb.params.w > 0.5 &&
+        all(shadowUv >= float2(0.0)) &&
+        all(shadowUv <= float2(1.0)) &&
+        shadowDepth >= 0.0 &&
+        shadowDepth <= 1.0)
+    {
+        const float normalBias = shadowCb.params.y * (1.0 - saturate(dot(N, L)));
+        const float compareDepth = shadowDepth - shadowCb.params.x - normalBias;
+        const float texel = shadowCb.texelSizes[cascadeIndex];
+
+        float lit = 1.0;
+        if (cascadeIndex == 0u)
+        {
+            lit = SampleShadowPCF(shadowMap0, shadowSampler, shadowUv, compareDepth, texel);
+        }
+        else if (cascadeIndex == 1u)
+        {
+            lit = SampleShadowPCF(shadowMap1, shadowSampler, shadowUv, compareDepth, texel);
+        }
+        else if (cascadeIndex == 2u)
+        {
+            lit = SampleShadowPCF(shadowMap2, shadowSampler, shadowUv, compareDepth, texel);
+        }
+        else
+        {
+            lit = SampleShadowPCF(shadowMap3, shadowSampler, shadowUv, compareDepth, texel);
+        }
+
+        shadowVisibility = mix(1.0 - shadowCb.params.z, 1.0, lit);
+    }
 
     float3 color =
         albedoSample.rgb * ambient +
-        albedoSample.rgb * diff * directionalRadiance +
-        materialSample.rgb * spec * directionalRadiance;
+        (albedoSample.rgb * diff + materialSample.rgb * spec) * directionalRadiance * shadowVisibility;
 
     return float4(color, 1.0);
 }

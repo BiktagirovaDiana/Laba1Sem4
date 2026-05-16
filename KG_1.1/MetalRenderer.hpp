@@ -119,6 +119,14 @@ private:
         simd::float4 yAndPadding = {0.0f, 0.0f, 0.0f, 0.0f};
     };
 
+    struct ShadowCB
+    {
+        simd::float4x4 lightViewProj[4];
+        simd::float4 cascadeSplits = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 texelSizes = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 params = {0.0025f, 0.02f, 0.62f, 4.0f};
+    };
+
     struct ParticleInstanceGPU
     {
         simd::float4 baseCenterAndSize = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -133,6 +141,7 @@ private:
     id<MTLCommandQueue> m_queue = nil;
 
     id<MTLRenderPipelineState> m_gbufferPSO = nil;
+    id<MTLRenderPipelineState> m_shadowPSO = nil;
     id<MTLRenderPipelineState> m_particleBillboardPSO = nil;
     id<MTLRenderPipelineState> m_lightingPSO = nil;
     id<MTLComputePipelineState> m_particleComputePSO = nil;
@@ -142,10 +151,13 @@ private:
     id<MTLTexture>             m_whiteTex = nil;
     id<MTLTexture>             m_blackTex = nil;
     id<MTLTexture>             m_flatNormalTex = nil;
+    id<MTLSamplerState>        m_shadowSampler = nil;
+    id<MTLTexture>             m_shadowMaps[4] = {nil, nil, nil, nil};
     id<MTLSamplerState>        m_sampler = nil;
     GBuffer                    m_gbuffer;
 
     id<MTLBuffer> m_cameraCB = nil;
+    id<MTLBuffer> m_shadowCB = nil;
 
     id<MTLBuffer> m_vb = nil;
     id<MTLBuffer> m_ib = nil;
@@ -214,6 +226,9 @@ private:
     DirectionalLight m_directionalLight = DirectionalLight(simd::float3{0.0f, -1.0f, 0.0f},
                                                            simd::float3{1.0f, 1.0f, 1.0f},
                                                            1.0f);
+    static constexpr uint32_t kShadowCascadeCount = 4;
+    static constexpr uint32_t kShadowMapSize = 2048;
+    bool m_enableCascadedShadows = true;
     float m_textureAnimTimeSeconds = 0.0f;
     float m_textureNearSpeedMultiplier = 4.0f;
     float m_textureFarSpeedMultiplier = 0.35f;
@@ -263,6 +278,7 @@ private:
 
     void CreateDeviceAndSwapchain();
     void CreateDepth();
+    void CreateShadowResources();
     void CreateShadersAndPSO();
     void CreateConstantBuffer();
     void CreateStructuredBuffers();

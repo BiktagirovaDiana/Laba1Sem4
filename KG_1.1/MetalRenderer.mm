@@ -73,6 +73,21 @@ static inline simd_float4x4 MatPerspectiveRH(float fovyRadians, float aspect, fl
     return m;
 }
 
+static inline simd_float4x4 MatOrthoRH(float left, float right, float bottom, float top, float zn, float zf)
+{
+    simd_float4x4 m = {};
+    m.columns[0] = (simd_float4){ 2.0f / (right - left), 0.0f, 0.0f, 0.0f };
+    m.columns[1] = (simd_float4){ 0.0f, 2.0f / (top - bottom), 0.0f, 0.0f };
+    m.columns[2] = (simd_float4){ 0.0f, 0.0f, 1.0f / (zn - zf), 0.0f };
+    m.columns[3] = (simd_float4){
+        -(right + left) / (right - left),
+        -(top + bottom) / (top - bottom),
+        zn / (zn - zf),
+        1.0f
+    };
+    return m;
+}
+
 static inline simd_float4x4 MatTranslation(simd_float3 t)
 {
     simd_float4x4 m = matrix_identity_float4x4;
@@ -426,6 +441,7 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateDeviceAndSwapchain();
     m_gbuffer.SetDevice(m_device);
     CreateDepth();
+    CreateShadowResources();
     CreateShadersAndPSO();
     CreateConstantBuffer();
     CreateStructuredBuffers();
@@ -576,6 +592,22 @@ void MetalRenderer::CreateDepth()
     m_dss = [m_device newDepthStencilStateWithDescriptor:ds];
 }
 
+void MetalRenderer::CreateShadowResources()
+{
+    MTLTextureDescriptor* shadowDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                           width:kShadowMapSize
+                                                          height:kShadowMapSize
+                                                       mipmapped:NO];
+    shadowDesc.storageMode = MTLStorageModePrivate;
+    shadowDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
+    {
+        m_shadowMaps[i] = [m_device newTextureWithDescriptor:shadowDesc];
+    }
+}
+
 void MetalRenderer::CreateShadersAndPSO()
 {
     NSError* err = nil;
@@ -613,6 +645,16 @@ void MetalRenderer::CreateShadersAndPSO()
 
     m_gbufferPSO = [m_device newRenderPipelineStateWithDescriptor:psoDesc error:&err];
     if (!m_gbufferPSO) { NSLog(@"GBuffer PSO error: %@", err); }
+
+    id<MTLFunction> vsShadow = [lib newFunctionWithName:@"vs_shadow"];
+    MTLRenderPipelineDescriptor* shadowDesc = [MTLRenderPipelineDescriptor new];
+    shadowDesc.vertexFunction = vsShadow;
+    shadowDesc.fragmentFunction = nil;
+    shadowDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    shadowDesc.vertexDescriptor = vd;
+
+    m_shadowPSO = [m_device newRenderPipelineStateWithDescriptor:shadowDesc error:&err];
+    if (!m_shadowPSO) { NSLog(@"Shadow PSO error: %@", err); }
 
     id<MTLFunction> vsParticleBillboard = [lib newFunctionWithName:@"vs_particle_billboard"];
     MTLRenderPipelineDescriptor* particleDesc = [MTLRenderPipelineDescriptor new];
@@ -656,6 +698,8 @@ void MetalRenderer::CreateShadersAndPSO()
 void MetalRenderer::CreateConstantBuffer()
 {
     m_cameraCB = [m_device newBufferWithLength:sizeof(CameraCB)
+                                       options:MTLResourceStorageModeShared];
+    m_shadowCB = [m_device newBufferWithLength:sizeof(ShadowCB)
                                        options:MTLResourceStorageModeShared];
 }
 
@@ -1341,6 +1385,14 @@ void MetalRenderer::CreateSamplerAndFallbackTexture()
     smpDesc.tAddressMode = MTLSamplerAddressModeRepeat;
     m_sampler = [m_device newSamplerStateWithDescriptor:smpDesc];
 
+    MTLSamplerDescriptor* shadowSmpDesc = [MTLSamplerDescriptor new];
+    shadowSmpDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    shadowSmpDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    shadowSmpDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    shadowSmpDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    shadowSmpDesc.compareFunction = MTLCompareFunctionLessEqual;
+    m_shadowSampler = [m_device newSamplerStateWithDescriptor:shadowSmpDesc];
+
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                    width:1
                                                                                   height:1
@@ -1508,7 +1560,6 @@ void MetalRenderer::DrawFrame()
             }
         }
 
-        // Texture animation is disabled for now: keep UV scroll time fixed at zero.
         cb->timeSeconds = 0.0f;
 
         // projection по размеру окна
@@ -1540,22 +1591,6 @@ void MetalRenderer::DrawFrame()
         UpdateParticleAnimation(cmd, dt);
         UpdateDustParticleAnimation(cmd, dt);
         UpdateRainParticleAnimation(cmd, dt);
-
-        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
-
-        // Geometry pass: fill the G-buffer.
-        [enc setRenderPipelineState:m_gbufferPSO];
-        [enc setDepthStencilState:m_dss];
-
-        [enc setVertexBuffer:m_vb offset:0 atIndex:0];
-        [enc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
-        [enc setFragmentSamplerState:m_sampler atIndex:0];
-        [enc setVertexSamplerState:m_sampler atIndex:0];
-
-        [enc setFragmentBuffer:m_appendStructuredBuffer offset:0 atIndex:3];
-        [enc setFragmentBuffer:m_appendCounterBuffer offset:0 atIndex:4];
-        [enc setFragmentBuffer:m_consumeStructuredBuffer offset:0 atIndex:5];
-        [enc setFragmentBuffer:m_consumeCounterBuffer offset:0 atIndex:6];
 
         if (!m_visibleInstances.empty())
         {
@@ -1637,6 +1672,177 @@ void MetalRenderer::DrawFrame()
                 }
             }
         }
+
+        ShadowCB* shadowCb = m_shadowCB ? (ShadowCB*)m_shadowCB.contents : nullptr;
+        if (shadowCb)
+        {
+            *shadowCb = ShadowCB{};
+            shadowCb->params = simd::float4{0.0018f, 0.0065f, 0.58f, m_enableCascadedShadows ? 4.0f : 0.0f};
+            for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
+            {
+                shadowCb->lightViewProj[i] = matrix_identity_float4x4;
+                shadowCb->texelSizes[i] = 1.0f / (float)kShadowMapSize;
+            }
+        }
+
+        if (m_enableCascadedShadows && m_shadowPSO && shadowCb)
+        {
+            float cascadeSplits[kShadowCascadeCount] = {};
+            constexpr float kCascadeSplitLambda = 0.82f;
+            const float safeNearPlane = fmaxf(nearPlane, 0.001f);
+            const float safeFarPlane = fmaxf(farPlane, safeNearPlane + 0.001f);
+            //Разделение на каскады
+            for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
+            {
+                const float p = (float)(i + 1u) / (float)kShadowCascadeCount;
+                const float logSplit = safeNearPlane * powf(safeFarPlane / safeNearPlane, p);
+                const float uniformSplit = safeNearPlane + (safeFarPlane - safeNearPlane) * p;
+                cascadeSplits[i] = logSplit * kCascadeSplitLambda + uniformSplit * (1.0f - kCascadeSplitLambda);
+            }
+            cascadeSplits[kShadowCascadeCount - 1u] = safeFarPlane;
+            shadowCb->cascadeSplits =
+                simd::float4{cascadeSplits[0], cascadeSplits[1], cascadeSplits[2], cascadeSplits[3]};
+
+            simd::float3 shadowRight = simd::normalize(simd::cross(front, simd::float3{0.0f, 1.0f, 0.0f}));
+            if (simd::length_squared(shadowRight) < 1e-5f)
+            {
+                shadowRight = simd::float3{1.0f, 0.0f, 0.0f};
+            }
+            const simd::float3 shadowUp = simd::normalize(simd::cross(shadowRight, front));
+            const simd::float3 lightDir = simd::normalize(m_directionalLight.GetDirection());
+
+            
+            float cascadeNear = nearPlane;
+            for (uint32_t cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
+            {
+                const float cascadeFar = cascadeSplits[cascadeIndex];
+                simd::float3 corners[8];
+                uint32_t cornerIndex = 0;
+                for (float depth : {cascadeNear, cascadeFar})
+                {
+                    const float halfHeight = depth * tanHalfFovY;
+                    const float halfWidth = depth * tanHalfFovX;
+                    const simd::float3 center = m_camPos + front * depth;
+                    corners[cornerIndex++] = center - shadowRight * halfWidth - shadowUp * halfHeight;
+                    corners[cornerIndex++] = center + shadowRight * halfWidth - shadowUp * halfHeight;
+                    corners[cornerIndex++] = center - shadowRight * halfWidth + shadowUp * halfHeight;
+                    corners[cornerIndex++] = center + shadowRight * halfWidth + shadowUp * halfHeight;
+                }
+
+                //матрицы света
+                simd::float3 cascadeCenter = simd::float3{0.0f, 0.0f, 0.0f};
+                for (const simd::float3& corner : corners)
+                {
+                    cascadeCenter += corner;
+                }
+                cascadeCenter /= 8.0f;
+
+                float cascadeRadius = 0.0f;
+                for (const simd::float3& corner : corners)
+                {
+                    cascadeRadius = fmaxf(cascadeRadius, simd::distance(cascadeCenter, corner));
+                }
+                cascadeRadius = ceilf(cascadeRadius * 16.0f) / 16.0f;
+
+                const simd::float4x4 lightView =
+                    LookAtRH(cascadeCenter - lightDir * (cascadeRadius * 2.0f),
+                             cascadeCenter,
+                             simd::float3{0.0f, 1.0f, 0.0f});
+                const simd::float4x4 lightProj =
+                    MatOrthoRH(-cascadeRadius,
+                               cascadeRadius,
+                               -cascadeRadius,
+                               cascadeRadius,
+                               0.1f,
+                               cascadeRadius * 4.0f);
+                shadowCb->lightViewProj[cascadeIndex] = simd_mul(lightProj, lightView);
+
+                if (!m_shadowMaps[cascadeIndex])
+                {
+                    cascadeNear = cascadeFar;
+                    continue;
+                }
+
+                MTLRenderPassDescriptor* shadowPass = [MTLRenderPassDescriptor renderPassDescriptor];
+                shadowPass.depthAttachment.texture = m_shadowMaps[cascadeIndex];
+                shadowPass.depthAttachment.loadAction = MTLLoadActionClear;
+                shadowPass.depthAttachment.storeAction = MTLStoreActionStore;
+                shadowPass.depthAttachment.clearDepth = 1.0;
+
+                id<MTLRenderCommandEncoder> shadowEnc = [cmd renderCommandEncoderWithDescriptor:shadowPass];
+                if (shadowEnc)
+                {
+                    [shadowEnc setRenderPipelineState:m_shadowPSO];
+                    [shadowEnc setDepthStencilState:m_dss];
+                    [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
+                    [shadowEnc setVertexSamplerState:m_sampler atIndex:0];
+
+                    for (const DrawBatch& b : m_batches)
+                    {
+                        if (b.instanceIndex >= m_visibleInstances.size() || m_visibleInstances[b.instanceIndex] == 0u)
+                        {
+                            continue;
+                        }
+
+                        const SceneInstance& instance = m_sceneInstances[b.instanceIndex];
+                        if (instance.sourceModelIndex == 3u &&
+                            b.instanceIndex < m_model4PlaneStates.size() &&
+                            m_model4PlaneStates[b.instanceIndex] != 0u)
+                        {
+                            continue;
+                        }
+
+                        MaterialGPU mat{};
+                        if (b.materialIndex < m_materials.size())
+                        {
+                            mat = m_materials[b.materialIndex];
+                        }
+                        const float modelTessellationStrength = GetTessellationStrengthForModel(b.sourceModelIndex);
+                        mat.detailParams.x = m_meshRadius * modelTessellationStrength * tessellationFactor;
+
+                        CameraCB shadowLocalCb = *cb;
+                        shadowLocalCb.view = lightView;
+                        shadowLocalCb.proj = lightProj;
+                        shadowLocalCb.world = simd_mul(MatTranslation(instance.worldOffset), MatScale(instance.scale));
+                        [shadowEnc setVertexBytes:&shadowLocalCb length:sizeof(CameraCB) atIndex:1];
+                        [shadowEnc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
+
+                        id<MTLTexture> heightTex = m_blackTex;
+                        if (b.materialIndex < m_heightTextures.size() && m_heightTextures[b.materialIndex])
+                        {
+                            heightTex = m_heightTextures[b.materialIndex];
+                        }
+                        [shadowEnc setVertexTexture:heightTex atIndex:0];
+
+                        [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:b.indexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:m_ib
+                                       indexBufferOffset:(NSUInteger)b.indexOffset * sizeof(uint32_t)];
+                    }
+
+                    [shadowEnc endEncoding];
+                }
+
+                cascadeNear = cascadeFar;
+            }
+        }
+
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:gbufferPass];
+
+
+        [enc setRenderPipelineState:m_gbufferPSO];
+        [enc setDepthStencilState:m_dss];
+
+        [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        [enc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
+        [enc setFragmentSamplerState:m_sampler atIndex:0];
+        [enc setVertexSamplerState:m_sampler atIndex:0];
+
+        [enc setFragmentBuffer:m_appendStructuredBuffer offset:0 atIndex:3];
+        [enc setFragmentBuffer:m_appendCounterBuffer offset:0 atIndex:4];
+        [enc setFragmentBuffer:m_consumeStructuredBuffer offset:0 atIndex:5];
+        [enc setFragmentBuffer:m_consumeCounterBuffer offset:0 atIndex:6];
 
         for (const DrawBatch& b : m_batches)
         {
@@ -1830,11 +2036,17 @@ void MetalRenderer::DrawFrame()
         }
         [lightingEnc setRenderPipelineState:m_lightingPSO];
         [lightingEnc setFragmentBuffer:m_cameraCB offset:0 atIndex:0];
+        [lightingEnc setFragmentBuffer:m_shadowCB offset:0 atIndex:1];
         [lightingEnc setFragmentSamplerState:m_sampler atIndex:0];
+        [lightingEnc setFragmentSamplerState:m_shadowSampler atIndex:1];
         [lightingEnc setFragmentTexture:m_gbuffer.GetAlbedoTexture() atIndex:0];
         [lightingEnc setFragmentTexture:m_gbuffer.GetNormalTexture() atIndex:1];
         [lightingEnc setFragmentTexture:m_gbuffer.GetPositionTexture() atIndex:2];
         [lightingEnc setFragmentTexture:m_gbuffer.GetMaterialTexture() atIndex:3];
+        [lightingEnc setFragmentTexture:m_shadowMaps[0] atIndex:4];
+        [lightingEnc setFragmentTexture:m_shadowMaps[1] atIndex:5];
+        [lightingEnc setFragmentTexture:m_shadowMaps[2] atIndex:6];
+        [lightingEnc setFragmentTexture:m_shadowMaps[3] atIndex:7];
         [lightingEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [lightingEnc endEncoding];
 
