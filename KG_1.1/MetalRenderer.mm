@@ -1320,6 +1320,18 @@ void MetalRenderer::CreateFencePlaneResources()
     // textureFlags.x=1 → has diffuse; .w=0 → not a plane-replacement sprite
     m_fenceMaterial.textureFlags = simd::uint4{m_fenceTexture ? 1u : 0u, 0u, 0u, 0u};
     m_fenceMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
+
+    // Shadow decal material: same alpha texture as the fence, but the diffuse
+    // multiplier is pure black so the fragment shader writes a fully dark
+    // albedo into the gbuffer wherever the fence mask is opaque.  The result
+    // looks like a fence-shaped shadow painted on the floor.
+    m_fenceShadowMaterial = {};
+    m_fenceShadowMaterial.kd_ns      = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_fenceShadowMaterial.ks_alpha   = simd::float4{0.0f, 0.0f, 0.0f, 1.0f};
+    m_fenceShadowMaterial.uvScale    = simd::float2{1.0f, 1.0f};
+    m_fenceShadowMaterial.uvSpeed    = simd::float2{0.0f, 0.0f};
+    m_fenceShadowMaterial.textureFlags = simd::uint4{m_fenceTexture ? 1u : 0u, 0u, 0u, 0u};
+    m_fenceShadowMaterial.detailParams = simd::float4{0.0f, 1.0f, 0.0f, 0.0f};
 }
 
 void MetalRenderer::UpdateParticleAnimation(id<MTLCommandBuffer> commandBuffer, float dt)
@@ -1931,8 +1943,13 @@ void MetalRenderer::DrawFrame()
                                        indexBufferOffset:(NSUInteger)b.indexOffset * sizeof(uint32_t)];
                     }
 
-                    // ── Fence: simple geometry shadow ────────────────────
-                    if (m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+                    // ── Fence: alpha-tested shadow ───────────────────────
+                    //   Switch to the dedicated fence shadow PSO so the
+                    //   fragment shader (ps_fence_shadow) can discard
+                    //   transparent pixels of the fence texture.  Without
+                    //   this the fence would punch a solid rectangle into
+                    //   the shadow map instead of leaving the gaps lit.
+                    if (m_fenceShadowPSO && m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
                     {
                         CameraCB fenceShadowCb = *cb;
                         fenceShadowCb.view  = lightView;
@@ -1945,46 +1962,24 @@ void MetalRenderer::DrawFrame()
                         MaterialGPU fenceShadowMat = m_fenceMaterial;
                         fenceShadowMat.detailParams.x = 0.0f;
 
+                        [shadowEnc setRenderPipelineState:m_fenceShadowPSO];
                         [shadowEnc setCullMode:MTLCullModeNone];
                         [shadowEnc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
                         [shadowEnc setVertexBytes:&fenceShadowCb length:sizeof(CameraCB) atIndex:1];
                         [shadowEnc setVertexBytes:&fenceShadowMat length:sizeof(MaterialGPU) atIndex:2];
-                        [shadowEnc setVertexTexture:m_blackTex atIndex:0];
+                        [shadowEnc setFragmentBytes:&fenceShadowMat length:sizeof(MaterialGPU) atIndex:2];
+                        [shadowEnc setFragmentTexture:(m_fenceTexture ? m_fenceTexture : m_whiteTex) atIndex:0];
+                        [shadowEnc setFragmentSamplerState:m_sampler atIndex:0];
 
                         [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                               indexCount:m_fenceIndexCount
                                                indexType:MTLIndexTypeUInt32
                                              indexBuffer:m_fenceIB
                                        indexBufferOffset:0];
-                        [shadowEnc setCullMode:MTLCullModeBack];
-                        [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
-                    }
 
-                    // ── Fence 2: simple geometry shadow ───────────────────
-                    if (m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
-                    {
-                        CameraCB fence2ShadowCb = *cb;
-                        fence2ShadowCb.view  = lightView;
-                        fence2ShadowCb.proj  = lightProj;
-                        fence2ShadowCb.world = FenceWorldMatrix(m_fence2Position, m_fence2Size,
-                                                                m_fence2YawRadians,
-                                                                m_fence2PitchRadians,
-                                                                m_fence2RollRadians);
-
-                        MaterialGPU fence2ShadowMat = m_fenceMaterial;
-                        fence2ShadowMat.detailParams.x = 0.0f;
-
-                        [shadowEnc setCullMode:MTLCullModeNone];
-                        [shadowEnc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
-                        [shadowEnc setVertexBytes:&fence2ShadowCb length:sizeof(CameraCB) atIndex:1];
-                        [shadowEnc setVertexBytes:&fence2ShadowMat length:sizeof(MaterialGPU) atIndex:2];
-                        [shadowEnc setVertexTexture:m_blackTex atIndex:0];
-
-                        [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                              indexCount:m_fenceIndexCount
-                                               indexType:MTLIndexTypeUInt32
-                                             indexBuffer:m_fenceIB
-                                       indexBufferOffset:0];
+                        // Restore default state for anything that might be
+                        // drawn after this block.
+                        [shadowEnc setRenderPipelineState:m_shadowPSO];
                         [shadowEnc setCullMode:MTLCullModeBack];
                         [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
                     }
@@ -2222,23 +2217,26 @@ void MetalRenderer::DrawFrame()
             [enc setCullMode:MTLCullModeBack];
         }
 
-        // ── Fence 2: GBuffer pass ─────────────────────────────────────────
-        if (m_fenceGbufferPSO && m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u)
+        // ── Fence shadow decal: flat quad on the ground textured with the ─────
+        //    fence alpha mask and a near-black diffuse multiplier.  Drawn with
+        //    the same gbuffer PSO so the alpha-test discards everything except
+        //    the fence silhouette.
+        if (m_fenceGbufferPSO && m_fenceVB && m_fenceIB && m_fenceIndexCount > 0u && m_fenceTexture)
         {
-            CameraCB fence2Cb = *cb;
-            fence2Cb.world = FenceWorldMatrix(m_fence2Position, m_fence2Size,
-                                              m_fence2YawRadians,
-                                              m_fence2PitchRadians,
-                                              m_fence2RollRadians);
+            CameraCB shadowCb = *cb;
+            shadowCb.world = FenceWorldMatrix(m_fenceShadowPosition, m_fenceShadowSize,
+                                              m_fenceShadowYawRadians,
+                                              m_fenceShadowPitchRadians,
+                                              m_fenceShadowRollRadians);
 
             [enc setRenderPipelineState:m_fenceGbufferPSO];
             [enc setCullMode:MTLCullModeNone];
             [enc setVertexBuffer:m_fenceVB offset:0 atIndex:0];
-            [enc setVertexBytes:&fence2Cb length:sizeof(CameraCB) atIndex:1];
-            [enc setVertexBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:2];
-            [enc setFragmentBytes:&fence2Cb length:sizeof(CameraCB) atIndex:0];
-            [enc setFragmentBytes:&m_fenceMaterial length:sizeof(MaterialGPU) atIndex:1];
-            [enc setFragmentTexture:(m_fenceTexture ? m_fenceTexture : m_whiteTex) atIndex:0];
+            [enc setVertexBytes:&shadowCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_fenceShadowMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setFragmentBytes:&shadowCb length:sizeof(CameraCB) atIndex:0];
+            [enc setFragmentBytes:&m_fenceShadowMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setFragmentTexture:m_fenceTexture atIndex:0];
             [enc setFragmentSamplerState:m_sampler atIndex:0];
 
             [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -2246,6 +2244,7 @@ void MetalRenderer::DrawFrame()
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:m_fenceIB
                      indexBufferOffset:0];
+
             [enc setCullMode:MTLCullModeBack];
         }
 
@@ -2278,3 +2277,4 @@ void MetalRenderer::DrawFrame()
         [cmd commit];
     }
 }
+

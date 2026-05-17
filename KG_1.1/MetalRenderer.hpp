@@ -284,19 +284,18 @@ private:
     id<MTLTexture> m_fenceTexture = nil;
     MaterialGPU    m_fenceMaterial;
 
-    // Plane 1
-    simd::float3   m_fencePosition    = {0.0f, 0.0f, -125.0f};
-    simd::float2   m_fenceSize        = {40.0f, 12.0f};
+    simd::float3   m_fencePosition    = {0.0f, 0.0f, -155.0f};
+    simd::float2   m_fenceSize        = {400.0f, 240.0f};
     float          m_fenceYawRadians   = 0.0f;
     float          m_fencePitchRadians = 0.0f;
     float          m_fenceRollRadians  = 0.0f;
 
-    // Plane 2
-    simd::float3   m_fence2Position    = {0.0f, 0.0f, -125.0f};
-    simd::float2   m_fence2Size        = {40.0f, 12.0f};
-    float          m_fence2YawRadians   = 0.0f;
-    float          m_fence2PitchRadians = 0.0f;
-    float          m_fence2RollRadians  = 0.0f;
+    MaterialGPU    m_fenceShadowMaterial;
+    simd::float3   m_fenceShadowPosition    = {0.0f, -5.92f, -131.0f};
+    simd::float2   m_fenceShadowSize        = {480.0f, 300.0f};
+    float          m_fenceShadowYawRadians   = 0.0f;
+    float          m_fenceShadowPitchRadians = (float)(M_PI * -0.5);
+    float          m_fenceShadowRollRadians  = 0.0f;
 
     void CreateFencePlaneResources();
     void CreateDeviceAndSwapchain();
@@ -321,3 +320,4 @@ private:
     float GetTessellationStrengthForModel(uint32_t modelIndex) const;
     simd::float3 GetOffsetForModel(uint32_t modelIndex) const;
 };
+
