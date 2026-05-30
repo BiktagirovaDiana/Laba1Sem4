@@ -451,6 +451,7 @@ struct CameraCB
     float          pad0;
     simd::float3   cameraPos;
     float          timeSeconds;
+    simd::float4   postProcessParams;
 };
 
 static simd::float4x4 Identity()
@@ -1650,6 +1651,11 @@ void MetalRenderer::DrawFrame()
             m_enableBvhFrustumCulling = !m_enableBvhFrustumCulling;
             NSLog(@"BVH frustum culling %@", m_enableBvhFrustumCulling ? @"enabled" : @"disabled");
         }
+        if (inp.KeyPressed(18)) // 1
+        {
+            m_enableVintagePostProcess = !m_enableVintagePostProcess;
+            NSLog(@"Vintage post process %@", m_enableVintagePostProcess ? @"enabled" : @"disabled");
+        }
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -1696,6 +1702,12 @@ void MetalRenderer::DrawFrame()
         cb->lightDir = m_directionalLight.GetDirection();
         cb->lightIntensity = m_directionalLight.GetIntensity();
         cb->lightColor = m_directionalLight.GetColor();
+        cb->postProcessParams = simd::float4{
+            m_enableVintagePostProcess ? 1.0f : 0.0f,
+            m_timeSeconds,
+            0.0f,
+            0.0f
+        };
 
         const float cameraToMeshDistance = simd::distance(m_camPos, m_meshCenter);
         const float tessellationFadeNear =
@@ -2270,11 +2282,10 @@ void MetalRenderer::DrawFrame()
         [lightingEnc setFragmentTexture:m_shadowMaps[1] atIndex:5];
         [lightingEnc setFragmentTexture:m_shadowMaps[2] atIndex:6];
         [lightingEnc setFragmentTexture:m_shadowMaps[3] atIndex:7];
-        [lightingEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [lightingEnc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         [lightingEnc endEncoding];
 
         [cmd presentDrawable:drawable];
         [cmd commit];
     }
 }
-

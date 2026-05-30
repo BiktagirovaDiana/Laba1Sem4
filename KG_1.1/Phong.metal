@@ -26,6 +26,7 @@ struct CameraCB
     float    pad0;
     float3   cameraPos;
     float    timeSeconds;
+    float4   postProcessParams;
 };
 
 struct ShadowCB
@@ -485,17 +486,42 @@ vertex FullscreenOut vs_fullscreen(uint vid [[vertex_id]])
 {
     FullscreenOut o;
 
-    float2 pos[3] =
+    constexpr float2 pos[4] =
     {
         float2(-1.0, -1.0),
-        float2( 3.0, -1.0),
-        float2(-1.0,  3.0)
+        float2( 1.0, -1.0),
+        float2(-1.0,  1.0),
+        float2( 1.0,  1.0)
     };
 
     o.position = float4(pos[vid], 0.0, 1.0);
     o.uv = pos[vid] * 0.5 + 0.5;
     o.uv.y = 1.0 - o.uv.y;
     return o;
+}
+
+fragment float4 ps_gbuffer_stub(FullscreenOut in [[stage_in]],
+                                texture2d<float> gbufferAlbedo [[texture(0)]],
+                                texture2d<float> gbufferNormal [[texture(1)]],
+                                texture2d<float> gbufferPosition [[texture(2)]],
+                                texture2d<float> gbufferMaterial [[texture(3)]],
+                                sampler linearSampler [[sampler(0)]])
+{
+    const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
+
+    const float4 albedo = gbufferAlbedo.sample(linearSampler, uv);
+    const float4 packedNormal = gbufferNormal.sample(linearSampler, uv);
+    const float4 worldPosition = gbufferPosition.sample(linearSampler, uv);
+    const float4 material = gbufferMaterial.sample(linearSampler, uv);
+
+    const float3 normal = normalize(packedNormal.xyz * 2.0 - 1.0);
+    const float specularPower = material.a;
+
+    (void)worldPosition;
+    (void)normal;
+    (void)specularPower;
+
+    return float4(albedo.rgb, 1.0);
 }
 
 static float SampleShadowMap(depth2d<float> shadowMap,
@@ -528,6 +554,28 @@ static float SampleShadowPCF(depth2d<float> shadowMap,
     return lit / sampleCount;
 }
 
+static float3 ApplyVintagePostProcess(float3 color, float2 uv, float timeSeconds)
+{
+    const float luminance = dot(color, float3(0.299, 0.587, 0.114));
+    const float3 sepia = float3(
+        dot(color, float3(0.393, 0.769, 0.189)),
+        dot(color, float3(0.349, 0.686, 0.168)),
+        dot(color, float3(0.272, 0.534, 0.131)));
+
+    color = mix(float3(luminance), color, 0.72);
+    color = mix(color, sepia, 0.42);
+
+    const float2 centeredUv = uv * 2.0 - 1.0;
+    const float vignette = smoothstep(1.35, 0.25, dot(centeredUv, centeredUv));
+    color *= mix(0.48, 1.08, vignette);
+
+    const float scanline = sin((uv.y + timeSeconds * 0.03) * 900.0) * 0.018;
+    const float grain = fract(sin(dot(uv + timeSeconds, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    color += scanline + grain * 0.055;
+
+    return saturate(color);
+}
+
 fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                             constant CameraCB& cb [[buffer(0)]],
                             constant ShadowCB& shadowCb [[buffer(1)]],
@@ -549,7 +597,12 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
         float3 topColor = float3(0.5, 0.7, 1.0);
         float3 bottomColor = float3(0.7, 0.85, 1.0);
         float t = saturate(1.0 - uv.y);
-        return float4(mix(bottomColor, topColor, t), 1.0);
+        float3 color = mix(bottomColor, topColor, t);
+        if (cb.postProcessParams.x > 0.5)
+        {
+            color = ApplyVintagePostProcess(color, uv, cb.postProcessParams.y);
+        }
+        return float4(color, 1.0);
     }
 
     const float3 N = normalize(gbufferNormal.sample(linearSampler, uv).xyz);
@@ -557,7 +610,12 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
     const float4 materialSample = gbufferMaterial.sample(linearSampler, uv);
     if (materialSample.a < 0.5)
     {
-        return float4(albedoSample.rgb * 1.15, 1.0);
+        float3 color = albedoSample.rgb * 1.15;
+        if (cb.postProcessParams.x > 0.5)
+        {
+            color = ApplyVintagePostProcess(color, uv, cb.postProcessParams.y);
+        }
+        return float4(color, 1.0);
     }
 
     float3 L = normalize(-cb.lightDir);
@@ -615,6 +673,11 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
     float3 color =
         albedoSample.rgb * ambient +
         (albedoSample.rgb * diff + materialSample.rgb * spec) * directionalRadiance * shadowVisibility;
+
+    if (cb.postProcessParams.x > 0.5)
+    {
+        color = ApplyVintagePostProcess(color, uv, cb.postProcessParams.y);
+    }
 
     return float4(color, 1.0);
 }

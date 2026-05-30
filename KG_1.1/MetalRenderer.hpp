@@ -237,6 +237,7 @@ private:
     float m_textureFarDistance = 8.0f;
     bool m_enableFrustumCulling = true;
     bool m_enableBvhFrustumCulling = true;
+    bool m_enableVintagePostProcess = false;
     int m_model4InstanceCount = 20000;
     float m_model4PlaneSwapDistance = 200.0f;
     float m_model4PlaneSwapHysteresis = 25.0f;
@@ -320,4 +321,3 @@ private:
     float GetTessellationStrengthForModel(uint32_t modelIndex) const;
     simd::float3 GetOffsetForModel(uint32_t modelIndex) const;
 };
-
