@@ -1656,6 +1656,11 @@ void MetalRenderer::DrawFrame()
             m_enableVintagePostProcess = !m_enableVintagePostProcess;
             NSLog(@"Vintage post process %@", m_enableVintagePostProcess ? @"enabled" : @"disabled");
         }
+        if (inp.KeyPressed(19)) // 2
+        {
+            m_enableChromaticAberration = !m_enableChromaticAberration;
+            NSLog(@"Chromatic aberration %@", m_enableChromaticAberration ? @"enabled" : @"disabled");
+        }
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -1705,8 +1710,8 @@ void MetalRenderer::DrawFrame()
         cb->postProcessParams = simd::float4{
             m_enableVintagePostProcess ? 1.0f : 0.0f,
             m_timeSeconds,
-            0.0f,
-            0.0f
+            m_enableChromaticAberration ? 1.0f : 0.0f,
+            0.0085f
         };
 
         const float cameraToMeshDistance = simd::distance(m_camPos, m_meshCenter);

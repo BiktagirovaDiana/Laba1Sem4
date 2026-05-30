@@ -238,6 +238,7 @@ private:
     bool m_enableFrustumCulling = true;
     bool m_enableBvhFrustumCulling = true;
     bool m_enableVintagePostProcess = false;
+    bool m_enableChromaticAberration = false;
     int m_model4InstanceCount = 20000;
     float m_model4PlaneSwapDistance = 200.0f;
     float m_model4PlaneSwapHysteresis = 25.0f;

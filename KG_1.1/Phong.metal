@@ -576,33 +576,28 @@ static float3 ApplyVintagePostProcess(float3 color, float2 uv, float timeSeconds
     return saturate(color);
 }
 
-fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
-                            constant CameraCB& cb [[buffer(0)]],
-                            constant ShadowCB& shadowCb [[buffer(1)]],
-                            texture2d<float> gbufferAlbedo [[texture(0)]],
-                            texture2d<float> gbufferNormal [[texture(1)]],
-                            texture2d<float> gbufferPosition [[texture(2)]],
-                            texture2d<float> gbufferMaterial [[texture(3)]],
-                            depth2d<float> shadowMap0 [[texture(4)]],
-                            depth2d<float> shadowMap1 [[texture(5)]],
-                            depth2d<float> shadowMap2 [[texture(6)]],
-                            depth2d<float> shadowMap3 [[texture(7)]],
-                            sampler linearSampler [[sampler(0)]],
-                            sampler shadowSampler [[sampler(1)]])
+static float3 SampleLightingColor(float2 uv,
+                                  constant CameraCB& cb,
+                                  constant ShadowCB& shadowCb,
+                                  texture2d<float> gbufferAlbedo,
+                                  texture2d<float> gbufferNormal,
+                                  texture2d<float> gbufferPosition,
+                                  texture2d<float> gbufferMaterial,
+                                  depth2d<float> shadowMap0,
+                                  depth2d<float> shadowMap1,
+                                  depth2d<float> shadowMap2,
+                                  depth2d<float> shadowMap3,
+                                  sampler linearSampler,
+                                  sampler shadowSampler)
 {
-    const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
+    uv = clamp(uv, float2(0.0), float2(1.0));
     const float4 albedoSample = gbufferAlbedo.sample(linearSampler, uv);
     if (albedoSample.a < 0.5)
     {
         float3 topColor = float3(0.5, 0.7, 1.0);
         float3 bottomColor = float3(0.7, 0.85, 1.0);
         float t = saturate(1.0 - uv.y);
-        float3 color = mix(bottomColor, topColor, t);
-        if (cb.postProcessParams.x > 0.5)
-        {
-            color = ApplyVintagePostProcess(color, uv, cb.postProcessParams.y);
-        }
-        return float4(color, 1.0);
+        return mix(bottomColor, topColor, t);
     }
 
     const float3 N = normalize(gbufferNormal.sample(linearSampler, uv).xyz);
@@ -610,12 +605,7 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
     const float4 materialSample = gbufferMaterial.sample(linearSampler, uv);
     if (materialSample.a < 0.5)
     {
-        float3 color = albedoSample.rgb * 1.15;
-        if (cb.postProcessParams.x > 0.5)
-        {
-            color = ApplyVintagePostProcess(color, uv, cb.postProcessParams.y);
-        }
-        return float4(color, 1.0);
+        return albedoSample.rgb * 1.15;
     }
 
     float3 L = normalize(-cb.lightDir);
@@ -670,9 +660,75 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
         shadowVisibility = mix(1.0 - shadowCb.params.z, 1.0, lit);
     }
 
-    float3 color =
+    return
         albedoSample.rgb * ambient +
         (albedoSample.rgb * diff + materialSample.rgb * spec) * directionalRadiance * shadowVisibility;
+}
+
+fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
+                            constant CameraCB& cb [[buffer(0)]],
+                            constant ShadowCB& shadowCb [[buffer(1)]],
+                            texture2d<float> gbufferAlbedo [[texture(0)]],
+                            texture2d<float> gbufferNormal [[texture(1)]],
+                            texture2d<float> gbufferPosition [[texture(2)]],
+                            texture2d<float> gbufferMaterial [[texture(3)]],
+                            depth2d<float> shadowMap0 [[texture(4)]],
+                            depth2d<float> shadowMap1 [[texture(5)]],
+                            depth2d<float> shadowMap2 [[texture(6)]],
+                            depth2d<float> shadowMap3 [[texture(7)]],
+                            sampler linearSampler [[sampler(0)]],
+                            sampler shadowSampler [[sampler(1)]])
+{
+    const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
+    float3 color = SampleLightingColor(uv,
+                                       cb,
+                                       shadowCb,
+                                       gbufferAlbedo,
+                                       gbufferNormal,
+                                       gbufferPosition,
+                                       gbufferMaterial,
+                                       shadowMap0,
+                                       shadowMap1,
+                                       shadowMap2,
+                                       shadowMap3,
+                                       linearSampler,
+                                       shadowSampler);
+
+    if (cb.postProcessParams.z > 0.5)
+    {
+        const float2 centeredUv = uv * 2.0 - 1.0;
+        const float radialDistance = length(centeredUv);
+        const float2 direction = (radialDistance > 0.0001) ? centeredUv / radialDistance : float2(1.0, 0.0);
+        const float2 channelOffset = direction * cb.postProcessParams.w * (0.35 + radialDistance);
+        const float3 redColor = SampleLightingColor(uv + channelOffset,
+                                                    cb,
+                                                    shadowCb,
+                                                    gbufferAlbedo,
+                                                    gbufferNormal,
+                                                    gbufferPosition,
+                                                    gbufferMaterial,
+                                                    shadowMap0,
+                                                    shadowMap1,
+                                                    shadowMap2,
+                                                    shadowMap3,
+                                                    linearSampler,
+                                                    shadowSampler);
+        const float3 blueColor = SampleLightingColor(uv - channelOffset,
+                                                     cb,
+                                                     shadowCb,
+                                                     gbufferAlbedo,
+                                                     gbufferNormal,
+                                                     gbufferPosition,
+                                                     gbufferMaterial,
+                                                     shadowMap0,
+                                                     shadowMap1,
+                                                     shadowMap2,
+                                                     shadowMap3,
+                                                     linearSampler,
+                                                     shadowSampler);
+
+        color = float3(redColor.r, color.g, blueColor.b);
+    }
 
     if (cb.postProcessParams.x > 0.5)
     {
