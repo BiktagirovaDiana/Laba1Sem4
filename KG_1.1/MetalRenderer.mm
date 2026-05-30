@@ -452,6 +452,7 @@ struct CameraCB
     simd::float3   cameraPos;
     float          timeSeconds;
     simd::float4   postProcessParams;
+    simd::float4   postProcessParams2;
 };
 
 static simd::float4x4 Identity()
@@ -1661,6 +1662,11 @@ void MetalRenderer::DrawFrame()
             m_enableChromaticAberration = !m_enableChromaticAberration;
             NSLog(@"Chromatic aberration %@", m_enableChromaticAberration ? @"enabled" : @"disabled");
         }
+        if (inp.KeyPressed(20)) // 3
+        {
+            m_enableEyeAdaptationPostProcess = !m_enableEyeAdaptationPostProcess;
+            NSLog(@"Eye Adaptation post process %@", m_enableEyeAdaptationPostProcess ? @"enabled" : @"disabled");
+        }
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -1712,6 +1718,12 @@ void MetalRenderer::DrawFrame()
             m_timeSeconds,
             m_enableChromaticAberration ? 1.0f : 0.0f,
             0.0085f
+        };
+        cb->postProcessParams2 = simd::float4{
+            m_enableEyeAdaptationPostProcess ? 1.0f : 0.0f,
+            0.0f,
+            0.0f,
+            0.0f
         };
 
         const float cameraToMeshDistance = simd::distance(m_camPos, m_meshCenter);

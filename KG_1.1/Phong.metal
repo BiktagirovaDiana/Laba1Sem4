@@ -27,6 +27,7 @@ struct CameraCB
     float3   cameraPos;
     float    timeSeconds;
     float4   postProcessParams;
+    float4   postProcessParams2;
 };
 
 struct ShadowCB
@@ -665,6 +666,52 @@ static float3 SampleLightingColor(float2 uv,
         (albedoSample.rgb * diff + materialSample.rgb * spec) * directionalRadiance * shadowVisibility;
 }
 
+static float3 EstimateSceneColor(texture2d<float> gbufferAlbedo, sampler linearSampler, float2 uv)
+{
+    const float4 albedo = gbufferAlbedo.sample(linearSampler, uv);
+    if (albedo.a >= 0.5)
+    {
+        return albedo.rgb;
+    }
+
+    const float3 topColor = float3(0.5, 0.7, 1.0);
+    const float3 bottomColor = float3(0.7, 0.85, 1.0);
+    const float t = saturate(1.0 - uv.y);
+    return mix(bottomColor, topColor, t);
+}
+
+static float3 ApplyEyeAdaptationPostProcess(float3 color,
+                                            texture2d<float> gbufferAlbedo,
+                                            sampler linearSampler)
+{
+    constexpr int sampleCount = 9;
+    constexpr float2 sampleUvs[sampleCount] =
+    {
+        float2(0.50, 0.50),
+        float2(0.25, 0.25),
+        float2(0.75, 0.25),
+        float2(0.25, 0.75),
+        float2(0.75, 0.75),
+        float2(0.50, 0.18),
+        float2(0.50, 0.82),
+        float2(0.18, 0.50),
+        float2(0.82, 0.50)
+    };
+
+    float averageLuminance = 0.0;
+    for (int i = 0; i < sampleCount; ++i)
+    {
+        const float3 sampleColor = EstimateSceneColor(gbufferAlbedo, linearSampler, sampleUvs[i]);
+        averageLuminance += dot(sampleColor, float3(0.2126, 0.7152, 0.0722));
+    }
+    averageLuminance /= float(sampleCount);
+
+    const float middleGray = 0.46;
+    const float exposure = clamp(middleGray / max(averageLuminance, 0.04), 0.45, 2.35);
+    const float3 adaptedColor = color * exposure;
+    return saturate(adaptedColor / (adaptedColor + float3(0.18)));
+}
+
 fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                             constant CameraCB& cb [[buffer(0)]],
                             constant ShadowCB& shadowCb [[buffer(1)]],
@@ -728,6 +775,11 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                                                      shadowSampler);
 
         color = float3(redColor.r, color.g, blueColor.b);
+    }
+
+    if (cb.postProcessParams2.x > 0.5)
+    {
+        color = ApplyEyeAdaptationPostProcess(color, gbufferAlbedo, linearSampler);
     }
 
     if (cb.postProcessParams.x > 0.5)
