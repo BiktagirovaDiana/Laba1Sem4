@@ -1805,6 +1805,16 @@ void MetalRenderer::DrawFrame()
             m_enableEyeAdaptationPostProcess = !m_enableEyeAdaptationPostProcess;
             NSLog(@"Eye Adaptation post process %@", m_enableEyeAdaptationPostProcess ? @"enabled" : @"disabled");
         }
+        if (inp.KeyPressed(11)) // B
+        {
+            m_useBeckmannNDF = true;
+            NSLog(@"NDF: Beckmann");
+        }
+        if (inp.KeyPressed(5)) // G
+        {
+            m_useBeckmannNDF = false;
+            NSLog(@"NDF: GGX");
+        }
 
         simd::float3 target = m_camPos + front;
         cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
@@ -1859,7 +1869,7 @@ void MetalRenderer::DrawFrame()
         };
         cb->postProcessParams2 = simd::float4{
             m_enableEyeAdaptationPostProcess ? 1.0f : 0.0f,
-            0.0f,
+            m_useBeckmannNDF ? 1.0f : 0.0f,
             0.0f,
             0.0f
         };

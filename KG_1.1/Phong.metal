@@ -580,12 +580,27 @@ static float PhongPowerToRoughness(float specularPower)
     return clamp(sqrt(2.0 / max(specularPower + 2.0, 2.0)), 0.045, 1.0);
 }
 
-static float DistributionGGX(float NdotH, float roughness)
+static float DistributionGGX(float NdotH,  float roughness)
 {
     const float a = roughness * roughness;
     const float a2 = a * a;
     const float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
     return a2 / max(3.14159265359 * denom * denom, 0.0001);
+}
+
+static float DistributionBeckmann(float NdotH, float roughness)
+{
+    const float a = roughness * roughness;
+    const float a2 = a * a;
+    const float NdotH2 = NdotH * NdotH;
+    return exp((NdotH2 - 1.0) / max(a2 * NdotH2, 0.0001)) /
+           max(3.14159265359 * a2 * NdotH2 * NdotH2, 0.0001);
+}
+
+static float DistributionNDF(float NdotH, float roughness, bool useBeckmann)
+{
+    return useBeckmann ? DistributionBeckmann(NdotH, roughness)
+                       : DistributionGGX(NdotH, roughness);
 }
 
 static float GeometrySchlickGGX(float NdotX, float roughness)
@@ -601,7 +616,7 @@ static float GeometrySmith(float NdotV, float NdotL, float roughness)
            GeometrySchlickGGX(NdotL, roughness);
 }
 
-static float3 FresnelSchlick(float cosTheta, float3 f0)
+static float3 FresnelSchlick(float cosTheta,  float3 f0)
 {
     return f0 + (1.0 - f0) * pow(1.0 - saturate(cosTheta), 5.0);
 }
@@ -670,7 +685,6 @@ static float3 SampleSpecularReflection(float3 reflectionDir,
         const float mipLevel = roughness * maxMip;
         return prefilteredMap.sample(linearSampler, reflectionDir, level(mipLevel)).rgb;
     }
-    // Analytical fallback when no pre-filtered map is loaded
     const float3 sharpReflection =
         SampleEnvironmentRadiance(reflectionDir, lightDir, lightColor, lightIntensity);
     const float3 blurredReflection =
@@ -730,12 +744,13 @@ static float3 SampleLightingColor(float2 uv,
     const float NdotH = saturate(dot(N, H));
     const float VdotH = saturate(dot(V, H));
 
-    const float D = DistributionGGX(NdotH, roughness);
+    const bool useBeckmann = cb.postProcessParams2.y > 0.5;
+    const float D = DistributionNDF(NdotH, roughness, useBeckmann);
     const float G = GeometrySmith(NdotV, NdotL, roughness);
     const float3 F = FresnelSchlick(VdotH, f0);
 
     const float3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
-    const float3 diffuse = (1.0 - F) * (1.0 - metallic) * albedo / 3.14159265359;
+    const float3 diffuse = (1.0  - F) * (1.0 - metallic) * albedo / 3.14159265359;
     const float3 directionalRadiance = cb.lightColor * cb.lightIntensity;
     const float viewDepth = -(cb.view * float4(worldPos, 1.0)).z;
 
