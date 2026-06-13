@@ -335,8 +335,6 @@ vertex float4 vs_shadow(VertexIn vin [[stage_in]],
     return cb.proj * cb.view * wp;
 }
 
-// ── Fence plane: shadow pass with alpha-test ──────────────────────────────────
-// VSOut is reused — we need uv in the fragment stage.
 struct FenceShadowVSOut
 {
     float4 position [[position]];
@@ -577,6 +575,110 @@ static float3 ApplyVintagePostProcess(float3 color, float2 uv, float timeSeconds
     return saturate(color);
 }
 
+static float PhongPowerToRoughness(float specularPower)
+{
+    return clamp(sqrt(2.0 / max(specularPower + 2.0, 2.0)), 0.045, 1.0);
+}
+
+static float DistributionGGX(float NdotH, float roughness)
+{
+    const float a = roughness * roughness;
+    const float a2 = a * a;
+    const float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265359 * denom * denom, 0.0001);
+}
+
+static float GeometrySchlickGGX(float NdotX, float roughness)
+{
+    const float r = roughness + 1.0;
+    const float k = (r * r) * 0.125;
+    return NdotX / max(NdotX * (1.0 - k) + k, 0.0001);
+}
+
+static float GeometrySmith(float NdotV, float NdotL, float roughness)
+{
+    return GeometrySchlickGGX(NdotV, roughness) *
+           GeometrySchlickGGX(NdotL, roughness);
+}
+
+static float3 FresnelSchlick(float cosTheta, float3 f0)
+{
+    return f0 + (1.0 - f0) * pow(1.0 - saturate(cosTheta), 5.0);
+}
+
+static float3 FresnelSchlickRoughness(float cosTheta, float3 f0, float roughness)
+{
+    return f0 + (max(float3(1.0 - roughness), f0) - f0) *
+        pow(1.0 - saturate(cosTheta), 5.0);
+}
+
+static float3 SampleEnvironmentRadiance(float3 direction,
+                                        float3 lightDir,
+                                        float3 lightColor,
+                                        float lightIntensity)
+{
+    const float3 dir = normalize(direction);
+    const float up = saturate(dir.y * 0.5 + 0.5);
+    const float skyT = smoothstep(0.08, 1.0, up);
+    const float groundT = smoothstep(-0.75, 0.25, dir.y);
+
+    const float3 zenithColor = float3(0.38, 0.52, 0.72);
+    const float3 horizonColor = float3(0.75, 0.82, 0.88);
+    const float3 groundColor = float3(0.18, 0.17, 0.14);
+    const float3 skyColor = mix(horizonColor, zenithColor, skyT);
+    float3 envColor = mix(groundColor, skyColor, groundT);
+
+    const float3 sunDir = normalize(-lightDir);
+    const float sunDisk = pow(saturate(dot(dir, sunDir)), 384.0);
+    const float sunGlow = pow(saturate(dot(dir, sunDir)), 12.0);
+    envColor += lightColor * lightIntensity * (sunDisk * 4.0 + sunGlow * 0.12);
+
+    return envColor;
+}
+
+static float3 SampleDiffuseIrradiance(float3 normal,
+                                      float3 lightDir,
+                                      float3 lightColor,
+                                      float lightIntensity)
+{
+    const float3 skyIrradiance =
+        SampleEnvironmentRadiance(normal, lightDir, lightColor, lightIntensity);
+    const float horizonFill = 0.35 + 0.25 * saturate(normal.y);
+    return skyIrradiance * horizonFill + float3(0.025, 0.025, 0.03);
+}
+
+static float3 SampleDiffuseIrradianceMap(texturecube<float> irradianceMap,
+                                         sampler linearSampler,
+                                         float3 normal)
+{
+    const float3 sampleDir = normalize(normal);
+    return irradianceMap.sample(linearSampler, sampleDir).rgb;
+}
+
+static float3 SampleSpecularReflection(float3 reflectionDir,
+                                       float3 normal,
+                                       float roughness,
+                                       texturecube<float> prefilteredMap,
+                                       sampler linearSampler,
+                                       float3 lightDir,
+                                       float3 lightColor,
+                                       float lightIntensity)
+{
+    if (prefilteredMap.get_num_mip_levels() > 1)
+    {
+        const float maxMip = float(prefilteredMap.get_num_mip_levels() - 1);
+        const float mipLevel = roughness * maxMip;
+        return prefilteredMap.sample(linearSampler, reflectionDir, level(mipLevel)).rgb;
+    }
+    // Analytical fallback when no pre-filtered map is loaded
+    const float3 sharpReflection =
+        SampleEnvironmentRadiance(reflectionDir, lightDir, lightColor, lightIntensity);
+    const float3 blurredReflection =
+        SampleDiffuseIrradiance(normal, lightDir, lightColor, lightIntensity);
+    const float blur = saturate(roughness * roughness);
+    return mix(sharpReflection, blurredReflection, blur);
+}
+
 static float3 SampleLightingColor(float2 uv,
                                   constant CameraCB& cb,
                                   constant ShadowCB& shadowCb,
@@ -588,6 +690,9 @@ static float3 SampleLightingColor(float2 uv,
                                   depth2d<float> shadowMap1,
                                   depth2d<float> shadowMap2,
                                   depth2d<float> shadowMap3,
+                                  texturecube<float> irradianceMap,
+                                  texture2d<float> brdfLut,
+                                  texturecube<float> prefilteredMap,
                                   sampler linearSampler,
                                   sampler shadowSampler)
 {
@@ -595,10 +700,11 @@ static float3 SampleLightingColor(float2 uv,
     const float4 albedoSample = gbufferAlbedo.sample(linearSampler, uv);
     if (albedoSample.a < 0.5)
     {
-        float3 topColor = float3(0.5, 0.7, 1.0);
-        float3 bottomColor = float3(0.7, 0.85, 1.0);
-        float t = saturate(1.0 - uv.y);
-        return mix(bottomColor, topColor, t);
+        const float3 viewDir = normalize(float3(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0));
+        return SampleEnvironmentRadiance(viewDir,
+                                         cb.lightDir,
+                                         cb.lightColor,
+                                         cb.lightIntensity);
     }
 
     const float3 N = normalize(gbufferNormal.sample(linearSampler, uv).xyz);
@@ -609,13 +715,27 @@ static float3 SampleLightingColor(float2 uv,
         return albedoSample.rgb * 1.15;
     }
 
-    float3 L = normalize(-cb.lightDir);
-    float3 V = normalize(cb.cameraPos - worldPos);
-    float3 R = reflect(-L, N);
+    const float3 albedo = saturate(albedoSample.rgb);
+    const float3 L = normalize(-cb.lightDir);
+    const float3 V = normalize(cb.cameraPos - worldPos);
+    const float3 H = normalize(V + L);
 
-    const float ambient = 0.10;
-    const float diff = max(dot(N, L), 0.0);
-    const float spec = pow(max(dot(R, V), 0.0), materialSample.a);
+    const float roughness = PhongPowerToRoughness(materialSample.a);
+    const float metallic = 0.0;
+    const float3 legacySpecular = clamp(materialSample.rgb, float3(0.04), float3(1.0));
+    const float3 f0 = mix(legacySpecular, albedo, metallic);
+
+    const float NdotL = saturate(dot(N, L));
+    const float NdotV = max(saturate(dot(N, V)), 0.001);
+    const float NdotH = saturate(dot(N, H));
+    const float VdotH = saturate(dot(V, H));
+
+    const float D = DistributionGGX(NdotH, roughness);
+    const float G = GeometrySmith(NdotV, NdotL, roughness);
+    const float3 F = FresnelSchlick(VdotH, f0);
+
+    const float3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
+    const float3 diffuse = (1.0 - F) * (1.0 - metallic) * albedo / 3.14159265359;
     const float3 directionalRadiance = cb.lightColor * cb.lightIntensity;
     const float viewDepth = -(cb.view * float4(worldPos, 1.0)).z;
 
@@ -661,9 +781,26 @@ static float3 SampleLightingColor(float2 uv,
         shadowVisibility = mix(1.0 - shadowCb.params.z, 1.0, lit);
     }
 
-    return
-        albedoSample.rgb * ambient +
-        (albedoSample.rgb * diff + materialSample.rgb * spec) * directionalRadiance * shadowVisibility;
+    const float3 iblF = FresnelSchlickRoughness(NdotV, f0, roughness);
+    const float3 iblDiffuseWeight = (1.0 - iblF) * (1.0 - metallic);
+    const float3 diffuseIrradiance =
+        SampleDiffuseIrradianceMap(irradianceMap, linearSampler, N);
+    const float2 brdf = brdfLut.sample(linearSampler, float2(NdotV, roughness)).rg;
+    const float3 reflectionDir = reflect(-V, N);
+    const float3 specularIbl =
+        SampleSpecularReflection(reflectionDir,
+                                 N,
+                                 roughness,
+                                 prefilteredMap,
+                                 linearSampler,
+                                 cb.lightDir,
+                                 cb.lightColor,
+                                 cb.lightIntensity) * (f0 * brdf.r + brdf.g);
+    const float3 diffuseIbl = diffuseIrradiance * albedo * iblDiffuseWeight * 0.35;
+    const float3 directLight =
+        (diffuse + specular) * directionalRadiance * NdotL * shadowVisibility;
+
+    return diffuseIbl + specularIbl + directLight;
 }
 
 static float3 EstimateSceneColor(texture2d<float> gbufferAlbedo, sampler linearSampler, float2 uv)
@@ -723,6 +860,9 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                             depth2d<float> shadowMap1 [[texture(5)]],
                             depth2d<float> shadowMap2 [[texture(6)]],
                             depth2d<float> shadowMap3 [[texture(7)]],
+                            texturecube<float> irradianceMap [[texture(8)]],
+                            texture2d<float> brdfLut [[texture(9)]],
+                            texturecube<float> prefilteredMap [[texture(10)]],
                             sampler linearSampler [[sampler(0)]],
                             sampler shadowSampler [[sampler(1)]])
 {
@@ -738,6 +878,9 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                                        shadowMap1,
                                        shadowMap2,
                                        shadowMap3,
+                                       irradianceMap,
+                                       brdfLut,
+                                       prefilteredMap,
                                        linearSampler,
                                        shadowSampler);
 
@@ -758,6 +901,9 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                                                     shadowMap1,
                                                     shadowMap2,
                                                     shadowMap3,
+                                                    irradianceMap,
+                                                    brdfLut,
+                                                    prefilteredMap,
                                                     linearSampler,
                                                     shadowSampler);
         const float3 blueColor = SampleLightingColor(uv - channelOffset,
@@ -771,6 +917,9 @@ fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
                                                      shadowMap1,
                                                      shadowMap2,
                                                      shadowMap3,
+                                                     irradianceMap,
+                                                     brdfLut,
+                                                     prefilteredMap,
                                                      linearSampler,
                                                      shadowSampler);
 

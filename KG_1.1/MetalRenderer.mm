@@ -266,6 +266,17 @@ static std::vector<std::string> GetAssetCandidateDirs()
 
 static bool ParseModelAssetName(const std::string& fileName, int& sortIndex)
 {
+    if (fileName == "woodroot.obj" || fileName == "wootroot.obj")
+    {
+        sortIndex = 5;
+        return true;
+    }
+    if (fileName == "cerberusobj.obj")
+    {
+        sortIndex = 6;
+        return true;
+    }
+
     constexpr const char* kPrefix = "model";
     constexpr const char* kSuffix = ".obj";
     if (fileName.size() < 9 || fileName.rfind(kSuffix) != fileName.size() - 4)
@@ -475,6 +486,9 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateDustParticleResources();
     CreateRainParticleResources();
     CreateFencePlaneResources();
+    LoadIrradianceMap();
+    LoadBrdfLut();
+    LoadPrefilteredMap();
     m_camPos = simd::float3{0.0f, 0.0f, 3.0f};
     m_camSpeed = 120.0f;
     m_yaw = (float)M_PI;
@@ -482,7 +496,7 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     LoadObjMesh();
     m_directionalLight = DirectionalLight(simd::float3{-0.3f, -1.0f, -0.2f},
                                           simd::float3{1.0f, 1.0f, 1.0f},
-                                          1.5f);
+                                          2.5f);
 }
  
 MetalRenderer::~MetalRenderer() {}
@@ -495,6 +509,16 @@ float MetalRenderer::GetTessellationStrengthForModel(uint32_t modelIndex) const
     }
 
     return m_tessellationStrength;
+}
+
+float MetalRenderer::GetScaleForModel(uint32_t modelIndex) const
+{
+    if (modelIndex < m_modelScales.size())
+    {
+        return m_modelScales[modelIndex];
+    }
+
+    return 1.0f;
 }
 
 simd::float3 MetalRenderer::GetOffsetForModel(uint32_t modelIndex) const
@@ -988,7 +1012,7 @@ void MetalRenderer::LoadObjMesh()
             SceneInstance instance;
             instance.sourceModelIndex = sourceModelIndex;
             instance.worldOffset = instanceOffset;
-            instance.scale = isModel4 ? 5.0f : 1.0f;
+            instance.scale = GetScaleForModel(sourceModelIndex);
             instance.worldAabbMin = instanceOffset + modelBounds.localAabbMin * instance.scale;
             instance.worldAabbMax = instanceOffset + modelBounds.localAabbMax * instance.scale;
             instance.worldCenter = instanceOffset + modelBounds.localCenter * instance.scale;
@@ -1485,6 +1509,34 @@ id<MTLTexture> MetalRenderer::LoadTextureOrNil(const std::string& path, bool srg
     return tex;
 }
 
+id<MTLTexture> MetalRenderer::LoadCubeTextureOrNil(const std::string& path, bool srgb)
+{
+    NSError* err = nil;
+    MTKTextureLoader* loader = [[MTKTextureLoader alloc] initWithDevice:m_device];
+    NSDictionary* options = @{
+        MTKTextureLoaderOptionSRGB : @(srgb),
+        MTKTextureLoaderOptionGenerateMipmaps : @NO
+    };
+    NSString* nsPath = [NSString stringWithUTF8String:path.c_str()];
+    NSURL* textureURL = [NSURL fileURLWithPath:nsPath];
+    id<MTLTexture> tex = [loader newTextureWithContentsOfURL:textureURL options:options error:&err];
+    if (!tex)
+    {
+        NSLog(@"Cube texture load failed (%@): %@", nsPath, err);
+        return nil;
+    }
+
+    if (tex.textureType != MTLTextureTypeCube)
+    {
+        NSLog(@"Cube texture load skipped (%@): texture type is %lu, expected cube",
+              nsPath,
+              (unsigned long)tex.textureType);
+        return nil;
+    }
+
+    return tex;
+}
+
 void MetalRenderer::CreateSamplerAndFallbackTexture()
 {
     MTLSamplerDescriptor* smpDesc = [MTLSamplerDescriptor new];
@@ -1518,6 +1570,92 @@ void MetalRenderer::CreateSamplerAndFallbackTexture()
     [m_whiteTex replaceRegion:region mipmapLevel:0 withBytes:&pixel bytesPerRow:4];
     [m_blackTex replaceRegion:region mipmapLevel:0 withBytes:&blackPixel bytesPerRow:4];
     [m_flatNormalTex replaceRegion:region mipmapLevel:0 withBytes:&flatNormalPixel bytesPerRow:4];
+
+    MTLTextureDescriptor* cubeDesc =
+        [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                              size:1
+                                                         mipmapped:NO];
+    cubeDesc.usage = MTLTextureUsageShaderRead;
+    m_fallbackIrradianceMap = [m_device newTextureWithDescriptor:cubeDesc];
+    const uint32_t irradiancePixel = 0xff242018u;
+    for (NSUInteger face = 0; face < 6; ++face)
+    {
+        [m_fallbackIrradianceMap replaceRegion:region
+                                   mipmapLevel:0
+                                         slice:face
+                                     withBytes:&irradiancePixel
+                                   bytesPerRow:4
+                                 bytesPerImage:4];
+    }
+
+    // Fallback BRDF LUT: 1x1 RG8 with scale=1, bias=0 (f0 * 1 + 0 = f0)
+    MTLTextureDescriptor* brdfDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
+                                                           width:1
+                                                          height:1
+                                                       mipmapped:NO];
+    brdfDesc.usage = MTLTextureUsageShaderRead;
+    m_fallbackBrdfLut = [m_device newTextureWithDescriptor:brdfDesc];
+    const uint8_t brdfPixel[2] = { 0xff, 0x00 };
+    [m_fallbackBrdfLut replaceRegion:region mipmapLevel:0 withBytes:brdfPixel bytesPerRow:2];
+
+    // Fallback pre-filtered environment map: 1x1 cube, neutral grey
+    MTLTextureDescriptor* prefiltDesc =
+        [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                             size:1
+                                                        mipmapped:NO];
+    prefiltDesc.usage = MTLTextureUsageShaderRead;
+    m_fallbackPrefilteredMap = [m_device newTextureWithDescriptor:prefiltDesc];
+    const uint32_t prefiltPixel = 0xff404040u;
+    for (NSUInteger face = 0; face < 6; ++face)
+    {
+        [m_fallbackPrefilteredMap replaceRegion:region
+                                    mipmapLevel:0
+                                          slice:face
+                                      withBytes:&prefiltPixel
+                                    bytesPerRow:4
+                                  bytesPerImage:4];
+    }
+}
+
+void MetalRenderer::LoadIrradianceMap()
+{
+    const std::string irradiancePath = ResolveAssetPath("IrradianceMap_BC6U.dds");
+    if (irradiancePath.empty())
+    {
+        NSLog(@"Irradiance map not found. Using fallback cubemap.");
+        m_irradianceMap = m_fallbackIrradianceMap;
+        return;
+    }
+
+    id<MTLTexture> irradiance = LoadCubeTextureOrNil(irradiancePath, false);
+    m_irradianceMap = irradiance ? irradiance : m_fallbackIrradianceMap;
+}
+
+void MetalRenderer::LoadBrdfLut()
+{
+    const std::string brdfPath = ResolveAssetPath("BrdfLut.png");
+    if (brdfPath.empty())
+    {
+        NSLog(@"BRDF LUT not found. Using fallback.");
+        m_brdfLut = m_fallbackBrdfLut;
+        return;
+    }
+    id<MTLTexture> lut = LoadTextureOrNil(brdfPath, false);
+    m_brdfLut = lut ? lut : m_fallbackBrdfLut;
+}
+
+void MetalRenderer::LoadPrefilteredMap()
+{
+    const std::string prefiltPath = ResolveAssetPath("PrefilteredMap_BC6U.dds");
+    if (prefiltPath.empty())
+    {
+        NSLog(@"Pre-filtered environment map not found. Using fallback cubemap.");
+        m_prefilteredMap = m_fallbackPrefilteredMap;
+        return;
+    }
+    id<MTLTexture> map = LoadCubeTextureOrNil(prefiltPath, false);
+    m_prefilteredMap = map ? map : m_fallbackPrefilteredMap;
 }
 
 static simd::float4x4 PerspectiveRH(float fovyRadians, float aspect, float zn, float zf)
@@ -2299,6 +2437,9 @@ void MetalRenderer::DrawFrame()
         [lightingEnc setFragmentTexture:m_shadowMaps[1] atIndex:5];
         [lightingEnc setFragmentTexture:m_shadowMaps[2] atIndex:6];
         [lightingEnc setFragmentTexture:m_shadowMaps[3] atIndex:7];
+        [lightingEnc setFragmentTexture:(m_irradianceMap ? m_irradianceMap : m_fallbackIrradianceMap) atIndex:8];
+        [lightingEnc setFragmentTexture:(m_brdfLut ? m_brdfLut : m_fallbackBrdfLut) atIndex:9];
+        [lightingEnc setFragmentTexture:(m_prefilteredMap ? m_prefilteredMap : m_fallbackPrefilteredMap) atIndex:10];
         [lightingEnc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         [lightingEnc endEncoding];
 

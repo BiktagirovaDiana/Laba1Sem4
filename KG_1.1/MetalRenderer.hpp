@@ -153,6 +153,12 @@ private:
     id<MTLTexture>             m_whiteTex = nil;
     id<MTLTexture>             m_blackTex = nil;
     id<MTLTexture>             m_flatNormalTex = nil;
+    id<MTLTexture>             m_fallbackIrradianceMap = nil;
+    id<MTLTexture>             m_irradianceMap = nil;
+    id<MTLTexture>             m_fallbackBrdfLut = nil;
+    id<MTLTexture>             m_brdfLut = nil;
+    id<MTLTexture>             m_fallbackPrefilteredMap = nil;
+    id<MTLTexture>             m_prefilteredMap = nil;
     id<MTLSamplerState>        m_shadowSampler = nil;
     id<MTLTexture>             m_shadowMaps[4] = {nil, nil, nil, nil};
     id<MTLSamplerState>        m_sampler = nil;
@@ -272,13 +278,16 @@ private:
     float m_rainBounceDistance = 6.5f;
     float m_rainCollisionBias = 5.75f;
     MaterialGPU m_rainParticleMaterial;
-    std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f};
+    std::vector<float> m_modelTessellationStrengths = {0.0f, 0.0005f, 0.00020f, 0.00020f, 0.0f, 0.0f};
+    std::vector<float> m_modelScales = {1.0f, 1.0f, 1.0f, 5.0f, 35.0f, 25.0f};
     std::vector<simd::float3> m_modelOffsets =
     {
         simd::float3{0.0f, 0.0f, 0.0f},
         simd::float3{0.0f, 0.0f, 0.0f},
         simd::float3{25.0f, 0.0f, 0.0f},
-        simd::float3{50.0f, 0.0f, 0.0f}
+        simd::float3{50.0f, 0.0f, 0.0f},
+        simd::float3{80.0f, 2.0f, -120.0f},
+        simd::float3{125.0f, 12.0f, -100.0f}
     };
 
     id<MTLBuffer>  m_fenceVB = nil;
@@ -317,9 +326,14 @@ private:
     void LoadObjMesh();
     void CreateModel4PlaneResources();
     void CreateSamplerAndFallbackTexture();
+    void LoadIrradianceMap();
+    void LoadBrdfLut();
+    void LoadPrefilteredMap();
     id<MTLTexture> LoadTextureOrNil(const std::string& path, bool srgb);
+    id<MTLTexture> LoadCubeTextureOrNil(const std::string& path, bool srgb);
     void BuildSceneBVH();
     uint32_t BuildSceneBVHNode(uint32_t begin, uint32_t end);
     float GetTessellationStrengthForModel(uint32_t modelIndex) const;
+    float GetScaleForModel(uint32_t modelIndex) const;
     simd::float3 GetOffsetForModel(uint32_t modelIndex) const;
 };

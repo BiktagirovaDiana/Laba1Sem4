@@ -38,6 +38,28 @@ std::string GetBaseDir(const std::string& path)
     return path.substr(0, slashPos + 1);
 }
 
+bool FileExists(const std::string& path)
+{
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file)
+    {
+        return false;
+    }
+
+    fclose(file);
+    return true;
+}
+
+std::string GetFileName(const std::string& path)
+{
+    const size_t slashPos = path.find_last_of("/\\");
+    if (slashPos == std::string::npos)
+    {
+        return path;
+    }
+    return path.substr(slashPos + 1);
+}
+
 bool IsAbsolutePath(const std::string& path)
 {
     if (path.empty())
@@ -58,6 +80,17 @@ std::string ToLowerCopy(std::string value)
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return (char)std::tolower(ch); });
     return value;
+}
+
+std::string ResolveSiblingTexture(const std::string& baseDir, const std::string& fileName)
+{
+    if (baseDir.empty() || fileName.empty())
+    {
+        return std::string();
+    }
+
+    const std::string fullPath = baseDir + fileName;
+    return FileExists(fullPath) ? fullPath : std::string();
 }
 
 bool LooksLikeHeightTexture(const std::string& texName)
@@ -89,17 +122,36 @@ std::string ResolveTexturePath(const std::string& baseDir, const std::string& te
     }
 
     const std::string directPath = baseDir + normalized;
-    FILE* directFile = fopen(directPath.c_str(), "rb");
-    if (directFile)
+    if (FileExists(directPath))
     {
-        fclose(directFile);
         return directPath;
     }
 
     const size_t slashPos = normalized.find_last_of('/');
     const std::string fileNameOnly =
         (slashPos == std::string::npos) ? normalized : normalized.substr(slashPos + 1);
-    return baseDir + fileNameOnly;
+    const std::string siblingPath = baseDir + fileNameOnly;
+    if (FileExists(siblingPath))
+    {
+        return siblingPath;
+    }
+
+    const size_t dotPos = fileNameOnly.find_last_of('.');
+    if (dotPos != std::string::npos)
+    {
+        const std::string stem = fileNameOnly.substr(0, dotPos);
+        const char* extensions[] = {".jpg", ".jpeg", ".png", ".tga"};
+        for (const char* ext : extensions)
+        {
+            const std::string candidate = baseDir + stem + ext;
+            if (FileExists(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+
+    return siblingPath;
 }
 }
 
@@ -160,8 +212,32 @@ bool ObjLoader::LoadMesh(const std::string& path, ObjMesh& outMesh)
         outMesh.materials.push_back(m);
     }
 
+    const std::string modelFileName = ToLowerCopy(GetFileName(path));
+    for (ObjMaterial& material : outMesh.materials)
+    {
+        if (modelFileName == "cerberusobj.obj")
+        {
+            if (material.diffuseTexPath.empty() || !FileExists(material.diffuseTexPath))
+            {
+                material.diffuseTexPath = ResolveSiblingTexture(baseDir, "Cerberus_A.jpg");
+            }
+            if (material.normalTexPath.empty())
+            {
+                material.normalTexPath = ResolveSiblingTexture(baseDir, "Cerberus_N.jpg");
+            }
+        }
+    }
+
+    ObjMaterial defaultMaterial{};
+    if (modelFileName == "woodroot.obj" || modelFileName == "wootroot.obj")
+    {
+        defaultMaterial.name = "woodroot";
+        defaultMaterial.diffuseTexPath = ResolveSiblingTexture(baseDir, "Aset_wood_root_M_rkswd_2K_Albedo.jpg");
+        defaultMaterial.normalTexPath = ResolveSiblingTexture(baseDir, "Aset_wood_root_M_rkswd_2K_Normal_LOD0.jpg");
+    }
+
     const uint32_t defaultMaterialIndex = (uint32_t)outMesh.materials.size();
-    outMesh.materials.push_back(ObjMaterial{});
+    outMesh.materials.push_back(defaultMaterial);
 
     std::unordered_map<Key, uint32_t, KeyHash> uniqueVerts;
     std::vector<std::vector<uint32_t>> perMaterialIndices(outMesh.materials.size());
