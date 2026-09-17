@@ -1,7 +1,9 @@
 #pragma once
+
+#include <simd/simd.h>
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <cstdint>
 
 struct VertexPNT
 {
@@ -37,8 +39,12 @@ struct ObjMesh
     std::vector<ObjSubmesh> submeshes;
 };
 
-class ObjLoader
+struct MaterialGPU
 {
-public:
-    static bool LoadMesh(const std::string& path, ObjMesh& outMesh);
+    simd::float4 kd_ns = {1.0f, 1.0f, 1.0f, 32.0f};
+    simd::float4 ks_alpha = {0.0f, 0.0f, 0.0f, 1.0f};
+    simd::float2 uvScale = {1.0f, 1.0f};
+    simd::float2 uvSpeed = {0.0f, 0.0f};
+    simd::uint4 textureFlags = {0u, 0u, 0u, 0u};
+    simd::float4 detailParams = {2.0f, 1.0f, 0.0f, 0.0f};
 };
