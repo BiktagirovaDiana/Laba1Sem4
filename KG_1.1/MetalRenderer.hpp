@@ -1,6 +1,7 @@
 #pragma once
 #import <MetalKit/MetalKit.h>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include "DirectionalLight.hpp"
 #include "GBuffer.hpp"
@@ -53,6 +54,29 @@ private:
         uint32_t firstInstance = 0;
         uint32_t instanceCount = 0;
         bool isLeaf = false;
+    };
+
+    struct TerrainTile
+    {
+        simd::float2 center = {0.0f, 0.0f};
+        float size = 1.0f;
+        uint32_t depth = 0;
+    };
+
+    struct TerrainSourceTile
+    {
+        std::vector<float> heights;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        id<MTLTexture> diffuseTexture = nil;
+        id<MTLTexture> normalTexture = nil;
+    };
+
+    struct TerrainDrawBatch
+    {
+        uint32_t indexOffset = 0;
+        uint32_t indexCount = 0;
+        uint32_t sourceTileIndex = 0;
     };
 
     struct MaterialGPU
@@ -169,6 +193,8 @@ private:
 
     id<MTLBuffer> m_vb = nil;
     id<MTLBuffer> m_ib = nil;
+    id<MTLBuffer> m_terrainVB = nil;
+    id<MTLBuffer> m_terrainIB = nil;
     id<MTLBuffer> m_model4PlaneVB = nil;
     id<MTLBuffer> m_model4PlaneIB = nil;
     id<MTLBuffer> m_particleQuadVB = nil;
@@ -211,6 +237,11 @@ private:
     id<MTLTexture> m_particleTexture = nil;
     id<MTLTexture> m_dustParticleTexture = nil;
     id<MTLTexture> m_rainParticleTexture = nil;
+    uint32_t m_terrainIndexCount = 0;
+    uint32_t m_terrainTileCount = 0;
+    MaterialGPU m_terrainMaterial;
+    std::vector<TerrainSourceTile> m_terrainSourceTiles;
+    std::vector<TerrainDrawBatch> m_terrainBatches;
     simd::float3 m_camPos = { 0.0f, 0.0f, 3.0f };
     float        m_camSpeed = 120.0f; // units/sec
     
@@ -291,25 +322,65 @@ private:
         simd::float3{125.0f, 12.0f, -100.0f}
     };
 
-    id<MTLBuffer>  m_fenceVB = nil;
-    id<MTLBuffer>  m_fenceIB = nil;
-    uint32_t       m_fenceIndexCount = 0;
+    id<MTLBuffer> m_fenceVB = nil;
+    id<MTLBuffer> m_fenceIB = nil;
+    uint32_t m_fenceIndexCount = 0;
     id<MTLTexture> m_fenceTexture = nil;
-    MaterialGPU    m_fenceMaterial;
+    MaterialGPU m_fenceMaterial;
 
-    simd::float3   m_fencePosition    = {0.0f, 0.0f, -155.0f};
-    simd::float2   m_fenceSize        = {400.0f, 240.0f};
-    float          m_fenceYawRadians   = 0.0f;
-    float          m_fencePitchRadians = 0.0f;
-    float          m_fenceRollRadians  = 0.0f;
+    simd::float3 m_fencePosition = {0.0f, 0.0f, -155.0f};
+    simd::float2 m_fenceSize = {400.0f, 240.0f};
+    float m_fenceYawRadians = 0.0f;
+    float m_fencePitchRadians = 0.0f;
+    float m_fenceRollRadians = 0.0f;
 
-    MaterialGPU    m_fenceShadowMaterial;
-    simd::float3   m_fenceShadowPosition    = {0.0f, -5.92f, -131.0f};
-    simd::float2   m_fenceShadowSize        = {480.0f, 300.0f};
-    float          m_fenceShadowYawRadians   = 0.0f;
-    float          m_fenceShadowPitchRadians = (float)(M_PI * -0.5);
-    float          m_fenceShadowRollRadians  = 0.0f;
+    MaterialGPU m_fenceShadowMaterial;
+    simd::float3 m_fenceShadowPosition = {0.0f, -5.92f, -131.0f};
+    simd::float2 m_fenceShadowSize = {480.0f, 300.0f};
+    float m_fenceShadowYawRadians = 0.0f;
+    float m_fenceShadowPitchRadians = (float)(M_PI * -0.5);
+    float m_fenceShadowRollRadians = 0.0f;
 
+    bool m_enableTerrain = true;
+    float m_terrainHalfSize = 480.0f;
+    float m_terrainBaseY = 100.0f;
+    float m_terrainMaxHeight = 42.0f;
+    uint32_t m_terrainMaxDepth = 6;
+    uint32_t m_terrainPatchResolution = 8;
+    float m_terrainLodDistanceFactor = 1.75f;
+
+    void CreateTerrainResources();
+    void LoadTerrainTiles();
+    TerrainSourceTile LoadTerrainSourceTile(const std::string& heightPath,
+                                            const std::string& diffusePath);
+    id<MTLTexture> CreateTerrainNormalTexture(const TerrainSourceTile& tile);
+    uint32_t GetTerrainSourceTileIndex(float x, float z) const;
+    float SampleTerrainHeightFromTile(const TerrainSourceTile& tile,
+                                      float u,
+                                      float v) const;
+    void UpdateTerrainMesh(const simd::float4x4& viewMatrix,
+                           float nearPlane,
+                           float farPlane,
+                           float tanHalfFovX,
+                           float tanHalfFovY);
+    void SelectTerrainTilesRecursive(simd::float2 center,
+                                     float size,
+                                     uint32_t depth,
+                                     const simd::float4x4& viewMatrix,
+                                     float nearPlane,
+                                     float farPlane,
+                                     float tanHalfFovX,
+                                     float tanHalfFovY,
+                                     std::vector<TerrainTile>& outTiles) const;
+    bool IsTerrainTileVisibleInFrustum(simd::float2 center,
+                                       float size,
+                                       const simd::float4x4& viewMatrix,
+                                       float nearPlane,
+                                       float farPlane,
+                                       float tanHalfFovX,
+                                       float tanHalfFovY) const;
+    float SampleTerrainHeight(float x, float z) const;
+    simd::float3 SampleTerrainNormal(float x, float z) const;
     void CreateFencePlaneResources();
     void CreateDeviceAndSwapchain();
     void CreateDepth();

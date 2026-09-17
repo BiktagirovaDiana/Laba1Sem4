@@ -408,6 +408,16 @@ static std::string ResolveAssetPath(const std::string& fileName)
     return std::string();
 }
 
+static std::string ResolveTerrainTileAssetPath(const std::string& fileName)
+{
+    std::string path = ResolveAssetPath(JoinPath("tiles", fileName));
+    if (!path.empty())
+    {
+        return path;
+    }
+    return ResolveAssetPath(JoinPath("Tiles", fileName));
+}
+
 static ObjMesh CreateTexturedPlaneMesh(const std::string& diffuseTexturePath)
 {
     ObjMesh mesh;
@@ -481,6 +491,7 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     CreateConstantBuffer();
     CreateStructuredBuffers();
     CreateSamplerAndFallbackTexture();
+    CreateTerrainResources();
     CreateModel4PlaneResources();
     CreateParticleResources();
     CreateDustParticleResources();
@@ -494,12 +505,460 @@ MetalRenderer::MetalRenderer(MTKView* view) : m_view(view)
     m_yaw = (float)M_PI;
     m_pitch = 0.0f;
     LoadObjMesh();
-    m_directionalLight = DirectionalLight(simd::float3{-0.3f, -1.0f, -0.2f},
+    m_directionalLight = DirectionalLight(simd::float3{0.0f, -1.0f, 0.0f},
                                           simd::float3{1.0f, 1.0f, 1.0f},
                                           2.5f);
 }
  
 MetalRenderer::~MetalRenderer() {}
+
+MetalRenderer::TerrainSourceTile MetalRenderer::LoadTerrainSourceTile(const std::string& heightPath,
+                                                                      const std::string& diffusePath)
+{
+    TerrainSourceTile tile;
+
+    if (!heightPath.empty())
+    {
+        NSString* nsPath = [NSString stringWithUTF8String:heightPath.c_str()];
+        NSData* imageData = [NSData dataWithContentsOfFile:nsPath];
+        NSBitmapImageRep* bitmap = imageData ? [NSBitmapImageRep imageRepWithData:imageData] : nil;
+        if (bitmap)
+        {
+            const NSInteger width = bitmap.pixelsWide;
+            const NSInteger height = bitmap.pixelsHigh;
+            const NSInteger bitsPerSample = std::max<NSInteger>(bitmap.bitsPerSample, 1);
+            const float maxSampleValue = (bitsPerSample >= 16) ? 65535.0f : 255.0f;
+
+            tile.width = (uint32_t)width;
+            tile.height = (uint32_t)height;
+            tile.heights.resize((size_t)width * (size_t)height);
+
+            NSUInteger pixel[4] = {0, 0, 0, 0};
+            for (NSInteger y = 0; y < height; ++y)
+            {
+                for (NSInteger x = 0; x < width; ++x)
+                {
+                    [bitmap getPixel:pixel atX:x y:y];
+                    const float normalizedHeight =
+                        fmaxf(0.0f, fminf((float)pixel[0] / maxSampleValue, 1.0f));
+                    tile.heights[(size_t)y * (size_t)width + (size_t)x] = normalizedHeight;
+                }
+            }
+        }
+        else
+        {
+            NSLog(@"Terrain heightmap load failed: %@", nsPath);
+        }
+    }
+
+    if (!diffusePath.empty())
+    {
+        tile.diffuseTexture = LoadTextureOrNil(diffusePath, true);
+    }
+    tile.normalTexture = CreateTerrainNormalTexture(tile);
+
+    return tile;
+}
+
+id<MTLTexture> MetalRenderer::CreateTerrainNormalTexture(const TerrainSourceTile& tile)
+{
+    if (tile.heights.empty() || tile.width == 0u || tile.height == 0u)
+    {
+        return nil;
+    }
+
+    std::vector<uint8_t> pixels((size_t)tile.width * (size_t)tile.height * 4u);
+    const float normalStrength = 18.0f;
+    auto sampleHeight = [&](uint32_t x, uint32_t y) -> float
+    {
+        x = std::min(x, tile.width - 1u);
+        y = std::min(y, tile.height - 1u);
+        return tile.heights[(size_t)y * tile.width + x];
+    };
+
+    for (uint32_t y = 0; y < tile.height; ++y)
+    {
+        for (uint32_t x = 0; x < tile.width; ++x)
+        {
+            const uint32_t xL = (x > 0u) ? x - 1u : x;
+            const uint32_t xR = std::min(x + 1u, tile.width - 1u);
+            const uint32_t yD = (y > 0u) ? y - 1u : y;
+            const uint32_t yU = std::min(y + 1u, tile.height - 1u);
+            const float hL = sampleHeight(xL, y);
+            const float hR = sampleHeight(xR, y);
+            const float hD = sampleHeight(x, yD);
+            const float hU = sampleHeight(x, yU);
+
+            const simd::float3 n =
+                simd::normalize(simd::float3{(hL - hR) * normalStrength,
+                                             (hD - hU) * normalStrength,
+                                             1.0f});
+            const size_t pixelOffset = ((size_t)y * tile.width + x) * 4u;
+            pixels[pixelOffset + 0u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.x * 0.5f + 0.5f, 1.0f)) * 255.0f);
+            pixels[pixelOffset + 1u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.y * 0.5f + 0.5f, 1.0f)) * 255.0f);
+            pixels[pixelOffset + 2u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.z * 0.5f + 0.5f, 1.0f)) * 255.0f);
+            pixels[pixelOffset + 3u] = 255u;
+        }
+    }
+
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:tile.width
+                                                          height:tile.height
+                                                       mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [m_device newTextureWithDescriptor:desc];
+    if (!texture)
+    {
+        return nil;
+    }
+
+    const MTLRegion region = MTLRegionMake2D(0, 0, tile.width, tile.height);
+    [texture replaceRegion:region
+               mipmapLevel:0
+                 withBytes:pixels.data()
+               bytesPerRow:(NSUInteger)tile.width * 4u];
+    return texture;
+}
+
+void MetalRenderer::LoadTerrainTiles()
+{
+    m_terrainSourceTiles.clear();
+    m_terrainSourceTiles.reserve(9);
+
+    for (uint32_t i = 1; i <= 9; ++i)
+    {
+        const std::string suffix = std::to_string(i) + ".png";
+        const std::string heightPath = ResolveTerrainTileAssetPath("heightmap_16bit-" + suffix);
+        const std::string diffusePath = ResolveTerrainTileAssetPath("satellite-" + suffix);
+
+        TerrainSourceTile tile = LoadTerrainSourceTile(heightPath, diffusePath);
+        if (tile.heights.empty())
+        {
+            NSLog(@"Terrain tile %u has no heightmap. height=%s diffuse=%s",
+                  i,
+                  heightPath.empty() ? "<missing>" : heightPath.c_str(),
+                  diffusePath.empty() ? "<missing>" : diffusePath.c_str());
+        }
+        m_terrainSourceTiles.push_back(tile);
+    }
+}
+
+uint32_t MetalRenderer::GetTerrainSourceTileIndex(float x, float z) const
+{
+    if (m_terrainSourceTiles.empty())
+    {
+        return 0u;
+    }
+
+    const float terrainSize = m_terrainHalfSize * 2.0f;
+    const float sourceTileSize = terrainSize / 3.0f;
+    const int col = std::max(0, std::min(2, (int)floorf((x + m_terrainHalfSize) / sourceTileSize)));
+    const int row = std::max(0, std::min(2, (int)floorf((z + m_terrainHalfSize) / sourceTileSize)));
+    const uint32_t index = (uint32_t)(row * 3 + col);
+    return std::min<uint32_t>(index, (uint32_t)m_terrainSourceTiles.size() - 1u);
+}
+
+float MetalRenderer::SampleTerrainHeightFromTile(const TerrainSourceTile& tile,
+                                                 float u,
+                                                 float v) const
+{
+    if (tile.heights.empty() || tile.width == 0u || tile.height == 0u)
+    {
+        return 0.5f;
+    }
+
+    u = fmaxf(0.0f, fminf(u, 1.0f));
+    v = fmaxf(0.0f, fminf(v, 1.0f));
+
+    const float fx = u * (float)(tile.width - 1u);
+    const float fy = v * (float)(tile.height - 1u);
+    const uint32_t x0 = (uint32_t)floorf(fx);
+    const uint32_t y0 = (uint32_t)floorf(fy);
+    const uint32_t x1 = std::min(x0 + 1u, tile.width - 1u);
+    const uint32_t y1 = std::min(y0 + 1u, tile.height - 1u);
+    const float tx = fx - (float)x0;
+    const float ty = fy - (float)y0;
+
+    const float h00 = tile.heights[(size_t)y0 * tile.width + x0];
+    const float h10 = tile.heights[(size_t)y0 * tile.width + x1];
+    const float h01 = tile.heights[(size_t)y1 * tile.width + x0];
+    const float h11 = tile.heights[(size_t)y1 * tile.width + x1];
+    const float hx0 = h00 + (h10 - h00) * tx;
+    const float hx1 = h01 + (h11 - h01) * tx;
+    return hx0 + (hx1 - hx0) * ty;
+}
+
+float MetalRenderer::SampleTerrainHeight(float x, float z) const
+{
+    if (!m_terrainSourceTiles.empty())
+    {
+        const float terrainSize = m_terrainHalfSize * 2.0f;
+        const float sourceTileSize = terrainSize / 3.0f;
+        const uint32_t sourceIndex = GetTerrainSourceTileIndex(x, z);
+        const uint32_t col = sourceIndex % 3u;
+        const uint32_t row = sourceIndex / 3u;
+        const float sourceMinX = -m_terrainHalfSize + (float)col * sourceTileSize;
+        const float sourceMinZ = -m_terrainHalfSize + (float)row * sourceTileSize;
+        const float u = (x - sourceMinX) / sourceTileSize;
+        const float v = (z - sourceMinZ) / sourceTileSize;
+        const float height01 = SampleTerrainHeightFromTile(m_terrainSourceTiles[sourceIndex], u, v);
+        return m_terrainBaseY + (height01 - 0.5f) * (m_terrainMaxHeight * 2.0f);
+    }
+
+    const float broad = sinf(x * 0.018f) * cosf(z * 0.014f) * 7.0f;
+    const float ridges = sinf((x + z) * 0.047f) * 2.4f;
+    const float detail = (sinf(x * 0.11f + 1.7f) + cosf(z * 0.095f - 0.4f)) * 0.85f;
+    const float centerFlatten = SmoothStep01(simd::length(simd::float2{x, z}) / 150.0f);
+    const float height = fmaxf(-m_terrainMaxHeight, fminf(broad + ridges + detail, m_terrainMaxHeight));
+    return m_terrainBaseY + height * centerFlatten;
+}
+
+simd::float3 MetalRenderer::SampleTerrainNormal(float x, float z) const
+{
+    const float step = 1.0f;
+    const float hL = SampleTerrainHeight(x - step, z);
+    const float hR = SampleTerrainHeight(x + step, z);
+    const float hD = SampleTerrainHeight(x, z - step);
+    const float hU = SampleTerrainHeight(x, z + step);
+    return simd::normalize(simd::float3{hL - hR, 2.0f * step, hD - hU});
+}
+
+void MetalRenderer::SelectTerrainTilesRecursive(simd::float2 center,
+                                                float size,
+                                                uint32_t depth,
+                                                const simd::float4x4& viewMatrix,
+                                                float nearPlane,
+                                                float farPlane,
+                                                float tanHalfFovX,
+                                                float tanHalfFovY,
+                                                std::vector<TerrainTile>& outTiles) const
+{
+    if (m_enableFrustumCulling &&
+        !IsTerrainTileVisibleInFrustum(center,
+                                       size,
+                                       viewMatrix,
+                                       nearPlane,
+                                       farPlane,
+                                       tanHalfFovX,
+                                       tanHalfFovY))
+    {
+        return;
+    }
+
+    const simd::float2 cameraXZ = simd::float2{m_camPos.x, m_camPos.z};
+    const float distanceToTile = simd::length(cameraXZ - center);
+    const bool shouldSplit =
+        depth < m_terrainMaxDepth &&
+        distanceToTile < size * m_terrainLodDistanceFactor;
+
+    if (!shouldSplit)
+    {
+        TerrainTile tile;
+        tile.center = center;
+        tile.size = size;
+        tile.depth = depth;
+        outTiles.push_back(tile);
+        return;
+    }
+
+    const float childSize = size * 0.5f;
+    const float childOffset = size * 0.25f;
+    SelectTerrainTilesRecursive(center + simd::float2{-childOffset, -childOffset},
+                                childSize,
+                                depth + 1u,
+                                viewMatrix,
+                                nearPlane,
+                                farPlane,
+                                tanHalfFovX,
+                                tanHalfFovY,
+                                outTiles);
+    SelectTerrainTilesRecursive(center + simd::float2{ childOffset, -childOffset},
+                                childSize,
+                                depth + 1u,
+                                viewMatrix,
+                                nearPlane,
+                                farPlane,
+                                tanHalfFovX,
+                                tanHalfFovY,
+                                outTiles);
+    SelectTerrainTilesRecursive(center + simd::float2{-childOffset,  childOffset},
+                                childSize,
+                                depth + 1u,
+                                viewMatrix,
+                                nearPlane,
+                                farPlane,
+                                tanHalfFovX,
+                                tanHalfFovY,
+                                outTiles);
+    SelectTerrainTilesRecursive(center + simd::float2{ childOffset,  childOffset},
+                                childSize,
+                                depth + 1u,
+                                viewMatrix,
+                                nearPlane,
+                                farPlane,
+                                tanHalfFovX,
+                                tanHalfFovY,
+                                outTiles);
+}
+
+bool MetalRenderer::IsTerrainTileVisibleInFrustum(simd::float2 center,
+                                                  float size,
+                                                  const simd::float4x4& viewMatrix,
+                                                  float nearPlane,
+                                                  float farPlane,
+                                                  float tanHalfFovX,
+                                                  float tanHalfFovY) const
+{
+    const simd::float3 tileCenter =
+        simd::float3{center.x, m_terrainBaseY, center.y};
+    const float horizontalRadius = size * 0.70710678f;
+    const float verticalRadius = m_terrainMaxHeight;
+    const float radius = sqrtf(horizontalRadius * horizontalRadius +
+                               verticalRadius * verticalRadius);
+    return IsSphereVisibleInFrustum(viewMatrix,
+                                    tileCenter,
+                                    radius,
+                                    nearPlane,
+                                    farPlane,
+                                    tanHalfFovX,
+                                    tanHalfFovY);
+}
+
+void MetalRenderer::CreateTerrainResources()
+{
+    LoadTerrainTiles();
+
+    m_terrainMaterial = {};
+    m_terrainMaterial.kd_ns = simd::float4{1.0f, 1.0f, 1.0f, 18.0f};
+    m_terrainMaterial.ks_alpha = simd::float4{0.015f, 0.018f, 0.012f, 1.0f};
+    m_terrainMaterial.uvScale = simd::float2{1.0f, 1.0f};
+    m_terrainMaterial.uvSpeed = simd::float2{0.0f, 0.0f};
+    m_terrainMaterial.textureFlags = simd::uint4{1u, 1u, 0u, 0u};
+    m_terrainMaterial.detailParams = simd::float4{0.0f, 0.65f, 0.0f, 0.0f};
+}
+
+void MetalRenderer::UpdateTerrainMesh(const simd::float4x4& viewMatrix,
+                                      float nearPlane,
+                                      float farPlane,
+                                      float tanHalfFovX,
+                                      float tanHalfFovY)
+{
+    if (!m_enableTerrain || m_terrainPatchResolution == 0u)
+    {
+        m_terrainVB = nil;
+        m_terrainIB = nil;
+        m_terrainIndexCount = 0u;
+        m_terrainTileCount = 0u;
+        m_terrainBatches.clear();
+        return;
+    }
+
+    std::vector<TerrainTile> tiles;
+    tiles.reserve(256);
+    const float terrainSize = m_terrainHalfSize * 2.0f;
+    const float sourceTileSize = terrainSize / 3.0f;
+    for (uint32_t row = 0; row < 3u; ++row)
+    {
+        for (uint32_t col = 0; col < 3u; ++col)
+        {
+            const simd::float2 sourceCenter =
+                simd::float2{-m_terrainHalfSize + ((float)col + 0.5f) * sourceTileSize,
+                             -m_terrainHalfSize + ((float)row + 0.5f) * sourceTileSize};
+            SelectTerrainTilesRecursive(sourceCenter,
+                                        sourceTileSize,
+                                        0u,
+                                        viewMatrix,
+                                        nearPlane,
+                                        farPlane,
+                                        tanHalfFovX,
+                                        tanHalfFovY,
+                                        tiles);
+        }
+    }
+
+    std::vector<VertexPNT> vertices;
+    std::vector<uint32_t> indices;
+    const uint32_t r = m_terrainPatchResolution;
+    const uint32_t vertsPerSide = r + 1u;
+    vertices.reserve(tiles.size() * vertsPerSide * vertsPerSide);
+    indices.reserve(tiles.size() * r * r * 6u);
+    m_terrainBatches.clear();
+    m_terrainBatches.reserve(tiles.size());
+
+    for (const TerrainTile& tile : tiles)
+    {
+        const uint32_t vertexBase = (uint32_t)vertices.size();
+        const uint32_t indexBase = (uint32_t)indices.size();
+        const float minX = tile.center.x - tile.size * 0.5f;
+        const float minZ = tile.center.y - tile.size * 0.5f;
+        const uint32_t sourceTileIndex = GetTerrainSourceTileIndex(tile.center.x, tile.center.y);
+        const uint32_t sourceCol = sourceTileIndex % 3u;
+        const uint32_t sourceRow = sourceTileIndex / 3u;
+        const float sourceMinX = -m_terrainHalfSize + (float)sourceCol * sourceTileSize;
+        const float sourceMinZ = -m_terrainHalfSize + (float)sourceRow * sourceTileSize;
+
+        for (uint32_t z = 0; z <= r; ++z)
+        {
+            const float fz = (float)z / (float)r;
+            const float worldZ = minZ + fz * tile.size;
+            for (uint32_t x = 0; x <= r; ++x)
+            {
+                const float fx = (float)x / (float)r;
+                const float worldX = minX + fx * tile.size;
+                const float worldY = SampleTerrainHeight(worldX, worldZ);
+                const simd::float3 n = SampleTerrainNormal(worldX, worldZ);
+                const float u = (worldX - sourceMinX) / sourceTileSize;
+                const float v = (worldZ - sourceMinZ) / sourceTileSize;
+                vertices.push_back(VertexPNT{worldX,
+                                             worldY,
+                                             worldZ,
+                                             n.x,
+                                             n.y,
+                                             n.z,
+                                             u,
+                                             v});
+            }
+        }
+
+        for (uint32_t z = 0; z < r; ++z)
+        {
+            for (uint32_t x = 0; x < r; ++x)
+            {
+                const uint32_t i0 = vertexBase + z * vertsPerSide + x;
+                const uint32_t i1 = i0 + 1u;
+                const uint32_t i2 = i0 + vertsPerSide;
+                const uint32_t i3 = i2 + 1u;
+                indices.push_back(i0);
+                indices.push_back(i2);
+                indices.push_back(i1);
+                indices.push_back(i1);
+                indices.push_back(i2);
+                indices.push_back(i3);
+            }
+        }
+
+        TerrainDrawBatch batch;
+        batch.indexOffset = indexBase;
+        batch.indexCount = (uint32_t)indices.size() - indexBase;
+        batch.sourceTileIndex = sourceTileIndex;
+        m_terrainBatches.push_back(batch);
+    }
+
+    m_terrainTileCount = (uint32_t)tiles.size();
+    m_terrainIndexCount = (uint32_t)indices.size();
+    m_terrainVB = nil;
+    m_terrainIB = nil;
+    if (!vertices.empty() && !indices.empty())
+    {
+        m_terrainVB = [m_device newBufferWithBytes:vertices.data()
+                                            length:vertices.size() * sizeof(VertexPNT)
+                                           options:MTLResourceStorageModeShared];
+        m_terrainIB = [m_device newBufferWithBytes:indices.data()
+                                            length:indices.size() * sizeof(uint32_t)
+                                           options:MTLResourceStorageModeShared];
+    }
+}
 
 float MetalRenderer::GetTessellationStrengthForModel(uint32_t modelIndex) const
 {
@@ -1855,7 +2314,8 @@ void MetalRenderer::DrawFrame()
         float aspect = (h > 0.0f) ? (w / h) : 1.0f;
 
         const float nearPlane = (m_meshRadius > 50.0f) ? 1.0f : 0.1f;
-        const float farPlane = fmaxf(nearPlane + 1.0f, m_meshRadius * 6.0f);
+        const float terrainFarPlane = m_enableTerrain ? (m_terrainHalfSize * 2.4f) : 0.0f;
+        const float farPlane = fmaxf(nearPlane + 1.0f, fmaxf(m_meshRadius * 6.0f, terrainFarPlane));
         cb->proj = PerspectiveRH(60.0f * (float)M_PI / 180.0f, aspect, nearPlane, farPlane);
 
         cb->lightDir = m_directionalLight.GetDirection();
@@ -1885,6 +2345,11 @@ void MetalRenderer::DrawFrame()
         tessellationFactor = fmaxf(0.0f, fminf(tessellationFactor, 1.0f));
         const float tanHalfFovY = tanf(60.0f * (float)M_PI / 360.0f);
         const float tanHalfFovX = tanHalfFovY * aspect;
+        UpdateTerrainMesh(cb->view,
+                          nearPlane,
+                          farPlane,
+                          tanHalfFovX,
+                          tanHalfFovY);
 
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         UpdateParticleAnimation(cmd, dt);
@@ -2120,6 +2585,26 @@ void MetalRenderer::DrawFrame()
                                        indexBufferOffset:(NSUInteger)b.indexOffset * sizeof(uint32_t)];
                     }
 
+                    if (m_enableTerrain && m_terrainVB && m_terrainIB && m_terrainIndexCount > 0u)
+                    {
+                        CameraCB terrainShadowCb = *cb;
+                        terrainShadowCb.view = lightView;
+                        terrainShadowCb.proj = lightProj;
+                        terrainShadowCb.world = matrix_identity_float4x4;
+
+                        [shadowEnc setVertexBuffer:m_terrainVB offset:0 atIndex:0];
+                        [shadowEnc setVertexBytes:&terrainShadowCb length:sizeof(CameraCB) atIndex:1];
+                        [shadowEnc setVertexBytes:&m_terrainMaterial length:sizeof(MaterialGPU) atIndex:2];
+                        [shadowEnc setVertexTexture:m_blackTex atIndex:0];
+                        [shadowEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:m_terrainIndexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:m_terrainIB
+                                       indexBufferOffset:0];
+
+                        [shadowEnc setVertexBuffer:m_vb offset:0 atIndex:0];
+                    }
+
                     // ── Fence: alpha-tested shadow ───────────────────────
                     //   Switch to the dedicated fence shadow PSO so the
                     //   fragment shader (ps_fence_shadow) can discard
@@ -2183,6 +2668,43 @@ void MetalRenderer::DrawFrame()
         [enc setFragmentBuffer:m_appendCounterBuffer offset:0 atIndex:4];
         [enc setFragmentBuffer:m_consumeStructuredBuffer offset:0 atIndex:5];
         [enc setFragmentBuffer:m_consumeCounterBuffer offset:0 atIndex:6];
+
+        if (m_enableTerrain && m_terrainVB && m_terrainIB && m_terrainIndexCount > 0u)
+        {
+            CameraCB terrainCb = *cb;
+            terrainCb.world = matrix_identity_float4x4;
+
+            [enc setVertexBuffer:m_terrainVB offset:0 atIndex:0];
+            [enc setVertexBytes:&terrainCb length:sizeof(CameraCB) atIndex:1];
+            [enc setVertexBytes:&m_terrainMaterial length:sizeof(MaterialGPU) atIndex:2];
+            [enc setFragmentBytes:&m_terrainMaterial length:sizeof(MaterialGPU) atIndex:1];
+            [enc setVertexTexture:m_blackTex atIndex:0];
+
+            for (const TerrainDrawBatch& batch : m_terrainBatches)
+            {
+                id<MTLTexture> diffuseTexture = m_whiteTex;
+                id<MTLTexture> normalTexture = m_flatNormalTex;
+                if (batch.sourceTileIndex < m_terrainSourceTiles.size() &&
+                    m_terrainSourceTiles[batch.sourceTileIndex].diffuseTexture)
+                {
+                    diffuseTexture = m_terrainSourceTiles[batch.sourceTileIndex].diffuseTexture;
+                }
+                if (batch.sourceTileIndex < m_terrainSourceTiles.size() &&
+                    m_terrainSourceTiles[batch.sourceTileIndex].normalTexture)
+                {
+                    normalTexture = m_terrainSourceTiles[batch.sourceTileIndex].normalTexture;
+                }
+                [enc setFragmentTexture:diffuseTexture atIndex:0];
+                [enc setFragmentTexture:normalTexture atIndex:1];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:batch.indexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:m_terrainIB
+                         indexBufferOffset:(NSUInteger)batch.indexOffset * sizeof(uint32_t)];
+            }
+
+            [enc setVertexBuffer:m_vb offset:0 atIndex:0];
+        }
 
         for (const DrawBatch& b : m_batches)
         {
