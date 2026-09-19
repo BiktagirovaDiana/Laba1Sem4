@@ -13,16 +13,18 @@ class Terrain
 public:
     struct DrawBatch
     {
-        uint32_t indexOffset = 0;
-        uint32_t indexCount = 0;
-        uint32_t sourceTileIndex = 0;
+        uint32_t indexOffset = 0; //откуда рисуем
+        uint32_t indexCount = 0; //сколько индексов рисовать
+        uint32_t sourceTileIndex = 0; //какие текстуры использовать
     };
 
-    struct SourceTile
+    struct SourceTile //данные исходных тайлов (по одному)
     {
-        std::vector<float> heights;
+        //данные из карты высоты
+        std::vector<float> heights; //высота в диапозоне от 0 до 1
         uint32_t width = 0;
         uint32_t height = 0;
+        
         id<MTLTexture> diffuseTexture = nil;
         id<MTLTexture> normalTexture = nil;
     };
@@ -50,16 +52,17 @@ public:
     const SourceTile* SourceTileAt(uint32_t index) const;
 
 private:
-    struct Tile
+    struct Tile //временный участок террейна
     {
         simd::float2 center = {0.0f, 0.0f};
         float size = 1.0f;
-        uint32_t depth = 0;
+        uint32_t depth = 0; //глубина разбиения, детализация
     };
 
     void LoadTiles();
-    SourceTile LoadSourceTile(const std::string& heightPath, const std::string& diffusePath);
-    id<MTLTexture> CreateNormalTexture(const SourceTile& tile);
+    SourceTile LoadSourceTile(const std::string& heightPath,
+                              const std::string& diffusePath,
+                              const std::string& normalPath);
     uint32_t GetSourceTileIndex(float x, float z) const;
     float SampleHeightFromTile(const SourceTile& tile, float u, float v) const;
     float SampleHeight(float x, float z) const;

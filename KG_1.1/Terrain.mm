@@ -157,7 +157,8 @@ const Terrain::SourceTile* Terrain::SourceTileAt(uint32_t index) const
 }
 
 Terrain::SourceTile Terrain::LoadSourceTile(const std::string& heightPath,
-                                            const std::string& diffusePath)
+                                            const std::string& diffusePath,
+                                            const std::string& normalPath)
 {
     SourceTile tile;
 
@@ -199,70 +200,12 @@ Terrain::SourceTile Terrain::LoadSourceTile(const std::string& heightPath,
     {
         tile.diffuseTexture = m_textureLoader(diffusePath, true);
     }
-    tile.normalTexture = CreateNormalTexture(tile);
+    if (!normalPath.empty() && m_textureLoader)
+    {
+        tile.normalTexture = m_textureLoader(normalPath, false);
+    }
 
     return tile;
-}
-
-id<MTLTexture> Terrain::CreateNormalTexture(const SourceTile& tile)
-{
-    if (tile.heights.empty() || tile.width == 0u || tile.height == 0u)
-    {
-        return nil;
-    }
-
-    std::vector<uint8_t> pixels((size_t)tile.width * (size_t)tile.height * 4u);
-    const float normalStrength = 18.0f;
-    auto sampleHeight = [&](uint32_t x, uint32_t y) -> float
-    {
-        x = std::min(x, tile.width - 1u);
-        y = std::min(y, tile.height - 1u);
-        return tile.heights[(size_t)y * tile.width + x];
-    };
-
-    for (uint32_t y = 0; y < tile.height; ++y)
-    {
-        for (uint32_t x = 0; x < tile.width; ++x)
-        {
-            const uint32_t xL = (x > 0u) ? x - 1u : x;
-            const uint32_t xR = std::min(x + 1u, tile.width - 1u);
-            const uint32_t yD = (y > 0u) ? y - 1u : y;
-            const uint32_t yU = std::min(y + 1u, tile.height - 1u);
-            const float hL = sampleHeight(xL, y);
-            const float hR = sampleHeight(xR, y);
-            const float hD = sampleHeight(x, yD);
-            const float hU = sampleHeight(x, yU);
-
-            const simd::float3 n =
-                simd::normalize(simd::float3{(hL - hR) * normalStrength,
-                                             (hD - hU) * normalStrength,
-                                             1.0f});
-            const size_t pixelOffset = ((size_t)y * tile.width + x) * 4u;
-            pixels[pixelOffset + 0u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.x * 0.5f + 0.5f, 1.0f)) * 255.0f);
-            pixels[pixelOffset + 1u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.y * 0.5f + 0.5f, 1.0f)) * 255.0f);
-            pixels[pixelOffset + 2u] = (uint8_t)lrintf(fmaxf(0.0f, fminf(n.z * 0.5f + 0.5f, 1.0f)) * 255.0f);
-            pixels[pixelOffset + 3u] = 255u;
-        }
-    }
-
-    MTLTextureDescriptor* desc =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                           width:tile.width
-                                                          height:tile.height
-                                                       mipmapped:NO];
-    desc.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> texture = [m_device newTextureWithDescriptor:desc];
-    if (!texture)
-    {
-        return nil;
-    }
-
-    const MTLRegion region = MTLRegionMake2D(0, 0, tile.width, tile.height);
-    [texture replaceRegion:region
-               mipmapLevel:0
-                 withBytes:pixels.data()
-               bytesPerRow:(NSUInteger)tile.width * 4u];
-    return texture;
 }
 
 void Terrain::LoadTiles()
@@ -275,8 +218,9 @@ void Terrain::LoadTiles()
         const std::string suffix = std::to_string(i) + ".png";
         const std::string heightPath = ResolveTerrainTileAssetPath("heightmap_16bit-" + suffix);
         const std::string diffusePath = ResolveTerrainTileAssetPath("satellite-" + suffix);
+        const std::string normalPath = ResolveTerrainTileAssetPath("satellite-" + std::to_string(i) + "-normal.png");
 
-        SourceTile tile = LoadSourceTile(heightPath, diffusePath);
+        SourceTile tile = LoadSourceTile(heightPath, diffusePath, normalPath);
         if (tile.heights.empty())
         {
             NSLog(@"Terrain tile %u has no heightmap. height=%s diffuse=%s",
@@ -366,6 +310,7 @@ simd::float3 Terrain::SampleNormal(float x, float z) const
     return simd::normalize(simd::float3{hL - hR, 2.0f * step, hD - hU});
 }
 
+//выбираем какие тайлы рисуем, убираем невидимые и делим ближайшие тайлы
 void Terrain::SelectTilesRecursive(simd::float2 center,
                                    float size,
                                    uint32_t depth,
@@ -498,7 +443,8 @@ void Terrain::UpdateMesh(const simd::float4x4& viewMatrix,
     tiles.reserve(256);
     const float terrainSize = m_halfSize * 2.0f;
     const float sourceTileSize = terrainSize / 3.0f;
-    for (uint32_t row = 0; row < 3u; ++row)
+    
+    for (uint32_t row = 0; row < 3u; ++row) //разделение террейна по горизонтали
     {
         for (uint32_t col = 0; col < 3u; ++col)
         {
@@ -518,6 +464,7 @@ void Terrain::UpdateMesh(const simd::float4x4& viewMatrix,
                                  tiles);
         }
     }
+    
 
     std::vector<VertexPNT> vertices;
     std::vector<uint32_t> indices;
