@@ -49,6 +49,7 @@ void Models::CreatePipelines(id<MTLDevice> device,
     fenceGbufDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
     fenceGbufDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
     fenceGbufDesc.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
+    fenceGbufDesc.colorAttachments[4].pixelFormat = MTLPixelFormatRG16Float;
     fenceGbufDesc.depthAttachmentPixelFormat = depthPixelFormat;
     fenceGbufDesc.vertexDescriptor = vertexDescriptor;
 

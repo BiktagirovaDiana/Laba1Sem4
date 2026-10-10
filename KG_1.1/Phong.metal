@@ -20,6 +20,7 @@ struct CameraCB
     float4x4 modelMatrix;
     float4x4 viewMatrix;
     float4x4 projectionMatrix;
+    float4x4 previousViewProjectionMatrix;
     float3   lightDir;
     float    lightIntensity;
     float3   lightColor;
@@ -248,6 +249,8 @@ kernel void cs_update_rain_particles(const device ParticleInstance* baseInstance
 struct VSOut
 {
     float4 position [[position]];
+    float4 clipPosition;
+    float4 previousClipPosition;
     float3 worldPos;
     float3 worldN;
     float2 uv;
@@ -259,7 +262,24 @@ struct GBufferOut
     float4 normal [[color(1)]];
     float4 position [[color(2)]];
     float4 material [[color(3)]];
+    float4 velocity [[color(4)]];
 };
+
+static float2 ClipToUv(float4 clipPosition)
+{
+    const float w = abs(clipPosition.w) > 0.0001
+        ? clipPosition.w
+        : select(-0.0001, 0.0001, clipPosition.w >= 0.0);
+    const float2 ndc = clipPosition.xy / w;
+    return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+static float4 EncodeVelocity(float4 currentClipPosition, float4 previousClipPosition)
+{
+    const float2 currentUv = ClipToUv(currentClipPosition);
+    const float2 previousUv = ClipToUv(previousClipPosition);
+    return float4(currentUv - previousUv, 0.0, 1.0);
+}
 
 static float3x3 CotangentFrame(float3 N, float3 worldPos, float2 uv)
 {
@@ -310,6 +330,8 @@ vertex VSOut vertex_shader_gbuffer(VertexIn vin [[stage_in]],
     float4 wp = cb.modelMatrix * float4(displacedPosition, 1.0);
     float4 vp = cb.viewMatrix  * wp;
     o.position = cb.projectionMatrix * vp;
+    o.clipPosition = o.position;
+    o.previousClipPosition = cb.previousViewProjectionMatrix * wp;
 
     o.worldPos = wp.xyz;
     o.worldN = normalize((cb.modelMatrix * float4(vin.normal, 0.0)).xyz);
@@ -371,6 +393,8 @@ vertex VSOut vertex_shader_fence_gbuffer(VertexIn vin [[stage_in]],
     const float4 wp = cb.modelMatrix * float4(vin.position, 1.0);
     VSOut o;
     o.position = cb.projectionMatrix * cb.viewMatrix * wp;
+    o.clipPosition = o.position;
+    o.previousClipPosition = cb.previousViewProjectionMatrix * wp;
     o.worldPos = wp.xyz;
     o.worldN = normalize((cb.modelMatrix * float4(vin.normal, 0.0)).xyz);
     o.uv = vin.uv * mat.uvScale;
@@ -395,6 +419,7 @@ fragment GBufferOut fragment_shader_fence_gbuffer(VSOut in [[stage_in]],
     outData.position = float4(in.worldPos, 1.0);
     // Use standard Phong material channel (non-zero .a → full lighting)
     outData.material = float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
+    outData.velocity = EncodeVelocity(in.clipPosition, in.previousClipPosition);
     return outData;
 }
 
@@ -426,6 +451,8 @@ vertex VSOut vertex_shader_particle_billboard(VertexIn vin [[stage_in]],
 
     VSOut o;
     o.position = cb.projectionMatrix * vp;
+    o.clipPosition = o.position;
+    o.previousClipPosition = cb.previousViewProjectionMatrix * wp;
     o.worldPos = worldPos;
     o.worldN = forward;
     o.uv = uv;
@@ -472,6 +499,7 @@ fragment GBufferOut fragment_shader_gbuffer(VSOut in [[stage_in]],
     outData.material = isPlaneReplacement
         ? float4(0.0, 0.0, 0.0, 0.0)
         : float4(mat.ks_alpha.rgb, max(mat.kd_ns.w, 1.0));
+    outData.velocity = EncodeVelocity(in.clipPosition, in.previousClipPosition);
     return outData;
 }
 
@@ -538,12 +566,44 @@ fragment float4 fragment_shader_copy_texture(FullscreenOut in [[stage_in]],
     return float4(sourceTexture.sample(linearSampler, uv).rgb, 1.0);
 }
 
+fragment float4 fragment_shader_velocity_overlay(FullscreenOut in [[stage_in]],
+                                                 texture2d<float> velocityTexture [[texture(0)]],
+                                                 sampler linearSampler [[sampler(0)]])
+{
+    const float2 origin = float2(0.735, 0.035);
+    const float2 size = float2(0.24, 0.24);
+    const float2 localUv = (in.uv - origin) / size;
+
+    if (any(localUv < float2(0.0)) || any(localUv > float2(1.0)))
+    {
+        discard_fragment();
+    }
+
+    const float border = 0.018;
+    if (localUv.x < border || localUv.x > 1.0 - border ||
+        localUv.y < border || localUv.y > 1.0 - border)
+    {
+        return float4(0.02, 0.02, 0.025, 1.0);
+    }
+
+    const float2 sampleUv = clamp((localUv - border) / (1.0 - border * 2.0),
+                                  float2(0.0),
+                                  float2(1.0));
+    const float2 velocity = velocityTexture.sample(linearSampler, sampleUv).xy;
+    const float magnitude = saturate(length(velocity) * 80.0);
+    const float2 directionColor = saturate(velocity * 24.0 + 0.5);
+    const float3 color = mix(float3(0.03, 0.03, 0.035),
+                             float3(directionColor.x, directionColor.y, magnitude),
+                             max(magnitude, 0.12));
+    return float4(color, 1.0);
+}
+
 fragment float4 fragment_shader_taa_resolve(FullscreenOut in [[stage_in]],
                                             constant TAAParams& params [[buffer(0)]],
                                             texture2d<float> currentTexture [[texture(0)]],
                                             texture2d<float> historyTexture [[texture(1)]],
-                                            texture2d<float> gbufferPosition [[texture(2)]],
-                                            texture2d<float> gbufferAlbedo [[texture(3)]],
+                                            texture2d<float> gbufferAlbedo [[texture(2)]],
+                                            texture2d<float> gbufferVelocity [[texture(3)]],
                                             sampler linearSampler [[sampler(0)]])
 {
     const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
@@ -569,13 +629,8 @@ fragment float4 fragment_shader_taa_resolve(FullscreenOut in [[stage_in]],
     float2 historyUv = uv;
     if (albedoSample.a >= 0.5)
     {
-        const float3 worldPos = gbufferPosition.sample(linearSampler, uv).xyz;
-        const float4 previousClip = params.previousViewProjectionMatrix * float4(worldPos, 1.0);
-        if (abs(previousClip.w) > 0.0001)
-        {
-            const float2 previousNdc = previousClip.xy / previousClip.w;
-            historyUv = float2(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
-        }
+        const float2 velocity = gbufferVelocity.sample(linearSampler, uv).xy;
+        historyUv = uv - velocity;
     }
 
     const bool resetHistory = params.flags.x > 0.5 ||

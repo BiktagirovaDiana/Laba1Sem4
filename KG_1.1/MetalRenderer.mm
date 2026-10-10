@@ -185,6 +185,7 @@ void MetalRenderer::CreateShadersAndPSO()
     psoDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
     psoDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
     psoDesc.colorAttachments[3].pixelFormat = MTLPixelFormatRGBA16Float;
+    psoDesc.colorAttachments[4].pixelFormat = MTLPixelFormatRG16Float;
     psoDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
@@ -222,6 +223,17 @@ void MetalRenderer::CreateShadersAndPSO()
 
     m_lightingPSO = [m_device newRenderPipelineStateWithDescriptor:lightingDesc error:&err];
     if (!m_lightingPSO) { NSLog(@"Lighting PSO error: %@", err); }
+
+    id<MTLFunction> fragmentShaderVelocityOverlay = [lib newFunctionWithName:@"fragment_shader_velocity_overlay"];
+    MTLRenderPipelineDescriptor* velocityOverlayDesc = [MTLRenderPipelineDescriptor new];
+    velocityOverlayDesc.vertexFunction = vertexShaderLighting;
+    velocityOverlayDesc.fragmentFunction = fragmentShaderVelocityOverlay;
+    velocityOverlayDesc.colorAttachments[0].pixelFormat = m_view.colorPixelFormat;
+    velocityOverlayDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+
+    err = nil;
+    m_velocityOverlayPSO = [m_device newRenderPipelineStateWithDescriptor:velocityOverlayDesc error:&err];
+    if (!m_velocityOverlayPSO) { NSLog(@"Velocity overlay PSO error: %@", err); }
 
     m_taa.CreatePipelines(m_device, lib, m_view.colorPixelFormat);
 }
@@ -672,6 +684,7 @@ void MetalRenderer::DrawFrame()
         const simd::float4x4 currentViewProjectionMatrix = simd_mul(cb->projectionMatrix, cb->viewMatrix);
         const simd::float4x4 previousViewProjectionMatrix =
             m_hasPreviousViewProjectionMatrix ? m_previousViewProjectionMatrix : currentViewProjectionMatrix;
+        cb->previousViewProjectionMatrix = previousViewProjectionMatrix;
 
         m_taa.EnsureResources(m_device, drawableWidth, drawableHeight, m_view.colorPixelFormat);
 
@@ -973,9 +986,25 @@ void MetalRenderer::DrawFrame()
             m_taa.EncodeResolve(cmd,
                                 drawableColorPass,
                                 m_sampler,
-                                m_gbuffer.GetPositionTexture(),
                                 m_gbuffer.GetAlbedoTexture(),
+                                m_gbuffer.GetVelocityTexture(),
                                 taaParams);
+        }
+
+        if (m_velocityOverlayPSO)
+        {
+            MTLRenderPassDescriptor* overlayPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            overlayPass.colorAttachments[0].texture = drawable.texture;
+            overlayPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            overlayPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+            id<MTLRenderCommandEncoder> overlayEnc =
+                [cmd renderCommandEncoderWithDescriptor:overlayPass];
+            [overlayEnc setRenderPipelineState:m_velocityOverlayPSO];
+            [overlayEnc setFragmentSamplerState:m_sampler atIndex:0];
+            [overlayEnc setFragmentTexture:m_gbuffer.GetVelocityTexture() atIndex:0];
+            [overlayEnc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            [overlayEnc endEncoding];
         }
 
         m_previousViewProjectionMatrix = currentViewProjectionMatrix;

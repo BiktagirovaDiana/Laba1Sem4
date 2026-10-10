@@ -27,8 +27,8 @@ public:
     void EncodeResolve(id<MTLCommandBuffer> commandBuffer,
                        MTLRenderPassDescriptor* drawablePass,
                        id<MTLSamplerState> sampler,
-                       id<MTLTexture> positionTexture,
                        id<MTLTexture> albedoTexture,
+                       id<MTLTexture> velocityTexture,
                        const ResolveParams& params);
 
 private:

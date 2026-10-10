@@ -53,12 +53,22 @@ void GBuffer::EnsureTextures(NSUInteger width, NSUInteger height)
     m_normalTexture = [m_device newTextureWithDescriptor:colorDesc];
     m_positionTexture = [m_device newTextureWithDescriptor:colorDesc];
     m_materialTexture = [m_device newTextureWithDescriptor:colorDesc];
+
+    MTLTextureDescriptor* velocityDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    velocityDesc.storageMode = MTLStorageModePrivate;
+    velocityDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    m_velocityTexture = [m_device newTextureWithDescriptor:velocityDesc];
     m_depthTexture = [m_device newTextureWithDescriptor:depthDesc];
 }
 
 bool GBuffer::IsReady() const
 {
-    return m_albedoTexture && m_normalTexture && m_positionTexture && m_materialTexture && m_depthTexture;
+    return m_albedoTexture && m_normalTexture && m_positionTexture &&
+           m_materialTexture && m_velocityTexture && m_depthTexture;
 }
 
 MTLRenderPassDescriptor* GBuffer::CreateRenderPassDescriptor() const
@@ -89,6 +99,11 @@ MTLRenderPassDescriptor* GBuffer::CreateRenderPassDescriptor() const
     renderPass.colorAttachments[3].storeAction = MTLStoreActionStore;
     renderPass.colorAttachments[3].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
+    renderPass.colorAttachments[4].texture = m_velocityTexture;
+    renderPass.colorAttachments[4].loadAction = MTLLoadActionClear;
+    renderPass.colorAttachments[4].storeAction = MTLStoreActionStore;
+    renderPass.colorAttachments[4].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
     renderPass.depthAttachment.texture = m_depthTexture;
     renderPass.depthAttachment.loadAction = MTLLoadActionClear;
     renderPass.depthAttachment.storeAction = MTLStoreActionDontCare;
@@ -115,6 +130,11 @@ id<MTLTexture> GBuffer::GetPositionTexture() const
 id<MTLTexture> GBuffer::GetMaterialTexture() const
 {
     return m_materialTexture;
+}
+
+id<MTLTexture> GBuffer::GetVelocityTexture() const
+{
+    return m_velocityTexture;
 }
 
 id<MTLTexture> GBuffer::GetDepthTexture() const

@@ -110,11 +110,12 @@ MTLRenderPassDescriptor* TAA::CreateCurrentColorPassDescriptor() const
 void TAA::EncodeResolve(id<MTLCommandBuffer> commandBuffer,
                         MTLRenderPassDescriptor* drawablePass,
                         id<MTLSamplerState> sampler,
-                        id<MTLTexture> positionTexture,
                         id<MTLTexture> albedoTexture,
+                        id<MTLTexture> velocityTexture,
                         const ResolveParams& params)
 {
-    if (!IsReady() || !commandBuffer || !drawablePass || !sampler || !positionTexture || !albedoTexture)
+    if (!IsReady() || !commandBuffer || !drawablePass || !sampler ||
+        !albedoTexture || !velocityTexture)
     {
         return;
     }
@@ -145,8 +146,8 @@ void TAA::EncodeResolve(id<MTLCommandBuffer> commandBuffer,
     [resolveEncoder setFragmentBytes:&localParams length:sizeof(ResolveParams) atIndex:0];
     [resolveEncoder setFragmentTexture:m_currentColorTexture atIndex:0];
     [resolveEncoder setFragmentTexture:m_historyTextures[readIndex] atIndex:1];
-    [resolveEncoder setFragmentTexture:positionTexture atIndex:2];
-    [resolveEncoder setFragmentTexture:albedoTexture atIndex:3];
+    [resolveEncoder setFragmentTexture:albedoTexture atIndex:2];
+    [resolveEncoder setFragmentTexture:velocityTexture atIndex:3];
     [resolveEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [resolveEncoder endEncoding];
 

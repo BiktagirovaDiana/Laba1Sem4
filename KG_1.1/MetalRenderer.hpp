@@ -38,6 +38,7 @@ private:
 
     id<MTLRenderPipelineState> m_gbufferPSO = nil;
     id<MTLRenderPipelineState> m_lightingPSO = nil;
+    id<MTLRenderPipelineState> m_velocityOverlayPSO = nil;
     id<MTLDepthStencilState>   m_dss = nil;
     id<MTLTexture>             m_whiteTex = nil;
     id<MTLTexture>             m_blackTex = nil;

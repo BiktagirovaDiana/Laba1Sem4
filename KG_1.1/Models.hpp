@@ -12,6 +12,7 @@ struct CameraCB
     simd::float4x4 modelMatrix;
     simd::float4x4 viewMatrix;
     simd::float4x4 projectionMatrix;
+    simd::float4x4 previousViewProjectionMatrix;
     simd::float3   lightDir;
     float          lightIntensity;
     simd::float3   lightColor;

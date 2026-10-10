@@ -17,6 +17,7 @@ public:
     id<MTLTexture> GetNormalTexture() const;
     id<MTLTexture> GetPositionTexture() const;
     id<MTLTexture> GetMaterialTexture() const;
+    id<MTLTexture> GetVelocityTexture() const;
     id<MTLTexture> GetDepthTexture() const;
 
 private:
@@ -25,6 +26,7 @@ private:
     id<MTLTexture> m_normalTexture = nil;
     id<MTLTexture> m_positionTexture = nil;
     id<MTLTexture> m_materialTexture = nil;
+    id<MTLTexture> m_velocityTexture = nil;
     id<MTLTexture> m_depthTexture = nil;
     NSUInteger m_width = 0;
     NSUInteger m_height = 0;
