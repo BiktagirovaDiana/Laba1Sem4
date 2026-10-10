@@ -7,6 +7,7 @@
 //
 
 #import "MetalRenderer.hpp"
+#include "MatrixFactory.hpp"
 #include <simd/simd.h>
 #include "InputDevice.hpp"
 #import <Foundation/Foundation.h>
@@ -19,20 +20,17 @@
 #include <string>
 #include <vector>
 
-static inline simd_float4x4 MatTranslation(simd_float3 t)
+static float Halton(uint32_t index, uint32_t base)
 {
-    simd_float4x4 m = matrix_identity_float4x4;
-    m.columns[3] = (simd_float4){ t.x, t.y, t.z, 1.0f };
-    return m;
-}
-
-static inline simd_float4x4 MatScale(float s)
-{
-    simd_float4x4 m = matrix_identity_float4x4;
-    m.columns[0].x = s;
-    m.columns[1].y = s;
-    m.columns[2].z = s;
-    return m;
+    float result = 0.0f;
+    float f = 1.0f;
+    while (index > 0)
+    {
+        f /= (float)base;
+        result += f * (float)(index % base);
+        index /= base;
+    }
+    return result;
 }
 
 static bool FileExists(const char* p)
@@ -177,12 +175,12 @@ void MetalRenderer::CreateShadersAndPSO()
 
     id<MTLLibrary> lib = [m_device newDefaultLibrary];
 
-    id<MTLFunction> vs = [lib newFunctionWithName:@"vs_gbuffer"];
-    id<MTLFunction> ps = [lib newFunctionWithName:@"ps_gbuffer"];
+    id<MTLFunction> vertexShaderGbuffer = [lib newFunctionWithName:@"vertex_shader_gbuffer"];
+    id<MTLFunction> fragmentShaderGbuffer = [lib newFunctionWithName:@"fragment_shader_gbuffer"];
 
     MTLRenderPipelineDescriptor* psoDesc = [MTLRenderPipelineDescriptor new];
-    psoDesc.vertexFunction = vs;
-    psoDesc.fragmentFunction = ps;
+    psoDesc.vertexFunction = vertexShaderGbuffer;
+    psoDesc.fragmentFunction = fragmentShaderGbuffer;
     psoDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     psoDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
     psoDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
@@ -213,18 +211,19 @@ void MetalRenderer::CreateShadersAndPSO()
     m_models.CreatePipelines(m_device, lib, vd, MTLPixelFormatDepth32Float);
     m_particleRenderer.CreatePipelines(m_device, lib, psoDesc);
 
-    id<MTLFunction> vsLighting = [lib newFunctionWithName:@"vs_fullscreen"];
-    id<MTLFunction> psLighting = [lib newFunctionWithName:@"ps_lighting"];
+    id<MTLFunction> vertexShaderLighting = [lib newFunctionWithName:@"vertex_shader_fullscreen"];
+    id<MTLFunction> fragmentShaderLighting = [lib newFunctionWithName:@"fragment_shader_lighting"];
 
     MTLRenderPipelineDescriptor* lightingDesc = [MTLRenderPipelineDescriptor new];
-    lightingDesc.vertexFunction = vsLighting;
-    lightingDesc.fragmentFunction = psLighting;
+    lightingDesc.vertexFunction = vertexShaderLighting;
+    lightingDesc.fragmentFunction = fragmentShaderLighting;
     lightingDesc.colorAttachments[0].pixelFormat = m_view.colorPixelFormat;
-    lightingDesc.depthAttachmentPixelFormat = m_view.depthStencilPixelFormat;
+    lightingDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
 
     m_lightingPSO = [m_device newRenderPipelineStateWithDescriptor:lightingDesc error:&err];
     if (!m_lightingPSO) { NSLog(@"Lighting PSO error: %@", err); }
 
+    m_taa.CreatePipelines(m_device, lib, m_view.colorPixelFormat);
 }
 
 void MetalRenderer::CreateConstantBuffer()
@@ -492,34 +491,6 @@ void MetalRenderer::LoadPrefilteredMap()
     m_prefilteredMap = map ? map : m_fallbackPrefilteredMap;
 }
 
-static simd::float4x4 PerspectiveRH(float fovyRadians, float aspect, float zn, float zf)
-{
-    float ys = 1.0f / tanf(fovyRadians * 0.5f);
-    float xs = ys / aspect;
-    float zs = zf / (zn - zf);
-
-    simd::float4x4 m{};
-    m.columns[0] = { xs, 0,  0,  0 };
-    m.columns[1] = { 0,  ys, 0,  0 };
-    m.columns[2] = { 0,  0,  zs, -1 };
-    m.columns[3] = { 0,  0,  zs * zn, 0 };
-    return m;
-}
-
-static simd::float4x4 LookAtRH(simd::float3 eye, simd::float3 at, simd::float3 up)
-{
-    simd::float3 z = simd::normalize(eye - at);
-    simd::float3 x = simd::normalize(simd::cross(up, z));
-    simd::float3 y = simd::cross(z, x);
-
-    simd::float4x4 m = matrix_identity_float4x4;
-    m.columns[0] = { x.x, y.x, z.x, 0 };
-    m.columns[1] = { x.y, y.y, z.y, 0 };
-    m.columns[2] = { x.z, y.z, z.z, 0 };
-    m.columns[3] = { -simd::dot(x, eye), -simd::dot(y, eye), -simd::dot(z, eye), 1 };
-    return m;
-}
-
 void MetalRenderer::DrawFrame()
 {
     if (m_scene.IndexCount() == 0 || !m_vb || !m_ib) {
@@ -550,12 +521,18 @@ void MetalRenderer::DrawFrame()
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.7, 1.0, 1.0);
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 
+        MTLRenderPassDescriptor* drawableColorPass = [MTLRenderPassDescriptor renderPassDescriptor];
+        drawableColorPass.colorAttachments[0].texture = drawable.texture;
+        drawableColorPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        drawableColorPass.colorAttachments[0].clearColor = MTLClearColorMake(0.5, 0.7, 1.0, 1.0);
+        drawableColorPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
         CameraCB* cb = (CameraCB*)m_cameraCB.contents;
 
         const float dt = 0.014f;
 
         //без анимации, статическая матрица
-        cb->world = matrix_identity_float4x4;
+        cb->modelMatrix = matrix_identity_float4x4;
 
         //управление камерой
         InputDevice& inp = InputDevice::Get();
@@ -593,8 +570,10 @@ void MetalRenderer::DrawFrame()
         if (inp.ModifierShift()) m_camPos.y -= m_camSpeed * dt;        // Shift — вниз
         if (inp.KeyPressed(17)) // T
         {
-            m_enableFrustumCulling = !m_enableFrustumCulling;
-            NSLog(@"Frustum culling %@", m_enableFrustumCulling ? @"enabled" : @"disabled");
+            m_enableTAA = !m_enableTAA;
+            m_taa.ResetHistory();
+            m_hasPreviousViewProjectionMatrix = false;
+            NSLog(@"TAA %@", m_enableTAA ? @"enabled" : @"disabled");
         }
         if (inp.KeyPressed(16)) // Y
         {
@@ -616,6 +595,11 @@ void MetalRenderer::DrawFrame()
             m_enableEyeAdaptationPostProcess = !m_enableEyeAdaptationPostProcess;
             NSLog(@"Eye Adaptation post process %@", m_enableEyeAdaptationPostProcess ? @"enabled" : @"disabled");
         }
+        if (inp.KeyPressed(21)) // 4
+        {
+            m_enableFrustumCulling = !m_enableFrustumCulling;
+            NSLog(@"Frustum culling %@", m_enableFrustumCulling ? @"enabled" : @"disabled");
+        }
         if (inp.KeyPressed(11)) // B
         {
             m_useBeckmannNDF = true;
@@ -628,7 +612,7 @@ void MetalRenderer::DrawFrame()
         }
 
         simd::float3 target = m_camPos + front;
-        cb->view = LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
+        cb->viewMatrix = MatrixFactory::LookAtRH(m_camPos, target, simd::float3{0, 1, 0});
         cb->cameraPos = m_camPos;
         m_timeSeconds += dt;
 
@@ -638,7 +622,7 @@ void MetalRenderer::DrawFrame()
 
         cb->timeSeconds = 0.0f;
 
-        // projection по размеру окна
+        //projection по размеру окна
         float w = (float)drawableWidth;
         float h = (float)drawableHeight;
         float aspect = (h > 0.0f) ? (w / h) : 1.0f;
@@ -647,7 +631,16 @@ void MetalRenderer::DrawFrame()
         const float nearPlane = (meshRadius > 50.0f) ? 1.0f : 0.1f;
         const float terrainFarPlane = m_terrain.IsEnabled() ? (m_terrain.HalfSize() * 2.4f) : 0.0f;
         const float farPlane = fmaxf(nearPlane + 1.0f, fmaxf(meshRadius * 6.0f, terrainFarPlane));
-        cb->proj = PerspectiveRH(60.0f * (float)M_PI / 180.0f, aspect, nearPlane, farPlane);
+        cb->projectionMatrix = MatrixFactory::PerspectiveRH(60.0f * (float)M_PI / 180.0f, aspect, nearPlane, farPlane);
+        
+        if (m_enableTAA && drawableWidth > 0 && drawableHeight > 0)
+        {
+            const uint32_t jitterIndex = (m_taaFrameIndex % 8u) + 1u;
+            const float jitterX = ((Halton(jitterIndex, 2u) - 0.5f) * 2.0f) / w;
+            const float jitterY = ((Halton(jitterIndex, 3u) - 0.5f) * 2.0f) / h;
+            cb->projectionMatrix.columns[2].x -= jitterX;
+            cb->projectionMatrix.columns[2].y -= jitterY;
+        }
 
         cb->lightDir = m_directionalLight.GetDirection();
         cb->lightIntensity = m_directionalLight.GetIntensity();
@@ -676,7 +669,13 @@ void MetalRenderer::DrawFrame()
         tessellationFactor = fmaxf(0.0f, fminf(tessellationFactor, 1.0f));
         const float tanHalfFovY = tanf(60.0f * (float)M_PI / 360.0f);
         const float tanHalfFovX = tanHalfFovY * aspect;
-        m_terrain.UpdateMesh(cb->view,
+        const simd::float4x4 currentViewProjectionMatrix = simd_mul(cb->projectionMatrix, cb->viewMatrix);
+        const simd::float4x4 previousViewProjectionMatrix =
+            m_hasPreviousViewProjectionMatrix ? m_previousViewProjectionMatrix : currentViewProjectionMatrix;
+
+        m_taa.EnsureResources(m_device, drawableWidth, drawableHeight, m_view.colorPixelFormat);
+
+        m_terrain.UpdateMesh(cb->viewMatrix,
                              nearPlane,
                              farPlane,
                              tanHalfFovX,
@@ -687,7 +686,7 @@ void MetalRenderer::DrawFrame()
         id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
         m_particleRenderer.Update(cmd, dt);
 
-        m_scene.UpdateVisibility(cb->view,
+        m_scene.UpdateVisibility(cb->viewMatrix,
                                  nearPlane,
                                  farPlane,
                                  tanHalfFovX,
@@ -707,8 +706,8 @@ void MetalRenderer::DrawFrame()
                                         tanHalfFovX,
                                         tanHalfFovY,
                                         [&](id<MTLRenderCommandEncoder> shadowEnc,
-                                            const simd::float4x4& lightView,
-                                            const simd::float4x4& lightProj,
+                                            const simd::float4x4& lightViewMatrix,
+                                            const simd::float4x4& lightProjectionMatrix,
                                             id<MTLRenderPipelineState> shadowPSO,
                                             id<MTLRenderPipelineState> fenceShadowPSO)
         {
@@ -736,9 +735,10 @@ void MetalRenderer::DrawFrame()
                 mat.detailParams.x = meshRadius * modelTessellationStrength * tessellationFactor;
 
                 CameraCB shadowLocalCb = *cb;
-                shadowLocalCb.view = lightView;
-                shadowLocalCb.proj = lightProj;
-                shadowLocalCb.world = simd_mul(MatTranslation(instance.worldOffset), MatScale(instance.scale));
+                shadowLocalCb.viewMatrix = lightViewMatrix;
+                shadowLocalCb.projectionMatrix = lightProjectionMatrix;
+                shadowLocalCb.modelMatrix = simd_mul(MatrixFactory::Translation(instance.worldOffset),
+                                               MatrixFactory::UniformScale(instance.scale));
                 [shadowEnc setVertexBytes:&shadowLocalCb length:sizeof(CameraCB) atIndex:1];
                 [shadowEnc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
 
@@ -759,9 +759,9 @@ void MetalRenderer::DrawFrame()
             if (m_terrain.IsDrawable())
             {
                 CameraCB terrainShadowCb = *cb;
-                terrainShadowCb.view = lightView;
-                terrainShadowCb.proj = lightProj;
-                terrainShadowCb.world = matrix_identity_float4x4;
+                terrainShadowCb.viewMatrix = lightViewMatrix;
+                terrainShadowCb.projectionMatrix = lightProjectionMatrix;
+                terrainShadowCb.modelMatrix = matrix_identity_float4x4;
 
                 [shadowEnc setVertexBuffer:m_terrain.VertexBuffer() offset:0 atIndex:0];
                 [shadowEnc setVertexBytes:&terrainShadowCb length:sizeof(CameraCB) atIndex:1];
@@ -779,8 +779,8 @@ void MetalRenderer::DrawFrame()
 
             m_models.DrawFenceShadowCaster(shadowEnc,
                                            *cb,
-                                           lightView,
-                                           lightProj,
+                                           lightViewMatrix,
+                                           lightProjectionMatrix,
                                            fenceShadowPSO,
                                            shadowPSO,
                                            m_sampler,
@@ -807,7 +807,7 @@ void MetalRenderer::DrawFrame()
         if (m_terrain.IsDrawable())
         {
             CameraCB terrainCb = *cb;
-            terrainCb.world = matrix_identity_float4x4;
+            terrainCb.modelMatrix = matrix_identity_float4x4;
             const MaterialGPU& terrainMaterial = m_terrain.Material();
 
             [enc setVertexBuffer:m_terrain.VertexBuffer() offset:0 atIndex:0];
@@ -868,7 +868,8 @@ void MetalRenderer::DrawFrame()
             mat.detailParams.x = displacementStrength;
 
             CameraCB localCb = *cb;
-            localCb.world = simd_mul(MatTranslation(instance.worldOffset), MatScale(instance.scale));
+            localCb.modelMatrix = simd_mul(MatrixFactory::Translation(instance.worldOffset),
+                                     MatrixFactory::UniformScale(instance.scale));
             [enc setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
             [enc setVertexBytes:&mat length:sizeof(MaterialGPU) atIndex:2];
             [enc setFragmentBytes:&mat length:sizeof(MaterialGPU) atIndex:1];
@@ -921,7 +922,13 @@ void MetalRenderer::DrawFrame()
 
         [enc endEncoding];
 
-        id<MTLRenderCommandEncoder> lightingEnc = [cmd renderCommandEncoderWithDescriptor:rp];
+        MTLRenderPassDescriptor* lightingPass = drawableColorPass;
+        if (m_enableTAA && m_taa.IsReady())
+        {
+            lightingPass = m_taa.CreateCurrentColorPassDescriptor();
+        }
+
+        id<MTLRenderCommandEncoder> lightingEnc = [cmd renderCommandEncoderWithDescriptor:lightingPass];
         if (!lightingEnc || !m_lightingPSO)
         {
             [cmd presentDrawable:drawable];
@@ -946,6 +953,34 @@ void MetalRenderer::DrawFrame()
         [lightingEnc setFragmentTexture:(m_prefilteredMap ? m_prefilteredMap : m_fallbackPrefilteredMap) atIndex:10];
         [lightingEnc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         [lightingEnc endEncoding];
+
+        if (m_enableTAA && m_taa.IsReady())
+        {
+            TAA::ResolveParams taaParams{};
+            taaParams.previousViewProjectionMatrix = previousViewProjectionMatrix;
+            taaParams.renderSizeAndBlend = simd::float4{
+                (float)drawableWidth,
+                (float)drawableHeight,
+                0.90f,
+                0.0f
+            };
+            taaParams.flags = simd::float4{
+                m_hasPreviousViewProjectionMatrix ? 0.0f : 1.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            };
+            m_taa.EncodeResolve(cmd,
+                                drawableColorPass,
+                                m_sampler,
+                                m_gbuffer.GetPositionTexture(),
+                                m_gbuffer.GetAlbedoTexture(),
+                                taaParams);
+        }
+
+        m_previousViewProjectionMatrix = currentViewProjectionMatrix;
+        m_hasPreviousViewProjectionMatrix = true;
+        ++m_taaFrameIndex;
 
         [cmd presentDrawable:drawable];
         [cmd commit];

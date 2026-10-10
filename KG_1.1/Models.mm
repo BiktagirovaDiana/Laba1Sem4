@@ -1,105 +1,9 @@
 #import "Models.hpp"
+#include "MatrixFactory.hpp"
 #import <Foundation/Foundation.h>
 
 #include <cmath>
 #include <vector>
-
-static inline simd_float4x4 MatIdentity()
-{
-    return matrix_identity_float4x4;
-}
-
-static inline simd_float4x4 MatRotationY(float a)
-{
-    const float c = cosf(a);
-    const float s = sinf(a);
-
-    simd_float4x4 m = MatIdentity();
-    m.columns[0] = (simd_float4){  c, 0.0f, -s, 0.0f };
-    m.columns[1] = (simd_float4){ 0.0f, 1.0f, 0.0f, 0.0f };
-    m.columns[2] = (simd_float4){  s, 0.0f,  c, 0.0f };
-    m.columns[3] = (simd_float4){ 0.0f, 0.0f, 0.0f, 1.0f };
-    return m;
-}
-
-static inline simd_float4x4 MatRotationX(float a)
-{
-    const float c = cosf(a);
-    const float s = sinf(a);
-
-    simd_float4x4 m = MatIdentity();
-    m.columns[1] = (simd_float4){ 0.0f,  c, s, 0.0f };
-    m.columns[2] = (simd_float4){ 0.0f, -s, c, 0.0f };
-    return m;
-}
-
-static inline simd_float4x4 MatRotationZ(float a)
-{
-    const float c = cosf(a);
-    const float s = sinf(a);
-
-    simd_float4x4 m = MatIdentity();
-    m.columns[0] = (simd_float4){  c, s, 0.0f, 0.0f };
-    m.columns[1] = (simd_float4){ -s, c, 0.0f, 0.0f };
-    return m;
-}
-
-static inline simd_float4x4 MatTranslation(simd_float3 t)
-{
-    simd_float4x4 m = matrix_identity_float4x4;
-    m.columns[3] = (simd_float4){ t.x, t.y, t.z, 1.0f };
-    return m;
-}
-
-static inline simd_float4x4 MatScale(float s)
-{
-    simd_float4x4 m = matrix_identity_float4x4;
-    m.columns[0].x = s;
-    m.columns[1].y = s;
-    m.columns[2].z = s;
-    return m;
-}
-
-static inline simd_float4x4 MatBillboardFacingCamera(simd_float3 objectPos, simd_float3 cameraPos)
-{
-    simd_float3 forward = cameraPos - objectPos;
-    if (simd_length_squared(forward) < 1e-6f)
-    {
-        forward = simd_float3{0.0f, 0.0f, 1.0f};
-    }
-    forward = simd_normalize(forward);
-
-    simd_float3 upHint = simd_float3{0.0f, 1.0f, 0.0f};
-    simd_float3 right = simd_cross(upHint, forward);
-    if (simd_length_squared(right) < 1e-6f)
-    {
-        upHint = simd_float3{1.0f, 0.0f, 0.0f};
-        right = simd_cross(upHint, forward);
-    }
-    right = simd_normalize(right);
-    const simd_float3 up = simd_normalize(simd_cross(forward, right));
-
-    simd_float4x4 m = matrix_identity_float4x4;
-    m.columns[0] = simd_float4{right.x, right.y, right.z, 0.0f};
-    m.columns[1] = simd_float4{up.x, up.y, up.z, 0.0f};
-    m.columns[2] = simd_float4{forward.x, forward.y, forward.z, 0.0f};
-    return m;
-}
-
-static inline simd_float4x4 FenceWorldMatrix(simd::float3 pos,
-                                             simd::float2 size,
-                                             float yaw,
-                                             float pitch,
-                                             float roll)
-{
-    simd_float4x4 scaleM = matrix_identity_float4x4;
-    scaleM.columns[0].x = size.x;
-    scaleM.columns[1].y = size.y;
-    const simd_float4x4 rot = simd_mul(simd_mul(MatRotationY(yaw),
-                                                MatRotationX(pitch)),
-                                       MatRotationZ(roll));
-    return simd_mul(simd_mul(MatTranslation(pos), rot), scaleM);
-}
 
 static ObjMesh CreateTexturedPlaneMesh(const std::string& diffuseTexturePath)
 {
@@ -136,11 +40,11 @@ void Models::CreatePipelines(id<MTLDevice> device,
                              MTLPixelFormat depthPixelFormat)
 {
     NSError* err = nil;
-    id<MTLFunction> vsFenceGbuf = [library newFunctionWithName:@"vs_fence_gbuffer"];
-    id<MTLFunction> psFenceGbuf = [library newFunctionWithName:@"ps_fence_gbuffer"];
+    id<MTLFunction> vertexShaderFenceGbuf = [library newFunctionWithName:@"vertex_shader_fence_gbuffer"];
+    id<MTLFunction> fragmentShaderFenceGbuf = [library newFunctionWithName:@"fragment_shader_fence_gbuffer"];
     MTLRenderPipelineDescriptor* fenceGbufDesc = [MTLRenderPipelineDescriptor new];
-    fenceGbufDesc.vertexFunction = vsFenceGbuf;
-    fenceGbufDesc.fragmentFunction = psFenceGbuf;
+    fenceGbufDesc.vertexFunction = vertexShaderFenceGbuf;
+    fenceGbufDesc.fragmentFunction = fragmentShaderFenceGbuf;
     fenceGbufDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     fenceGbufDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
     fenceGbufDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
@@ -223,8 +127,8 @@ void Models::CreateResources(id<MTLDevice> device,
 
 void Models::DrawFenceShadowCaster(id<MTLRenderCommandEncoder> encoder,
                                    const CameraCB& camera,
-                                   const simd::float4x4& lightView,
-                                   const simd::float4x4& lightProj,
+                                   const simd::float4x4& lightViewMatrix,
+                                   const simd::float4x4& lightProjectionMatrix,
                                    id<MTLRenderPipelineState> fenceShadowPSO,
                                    id<MTLRenderPipelineState> restorePSO,
                                    id<MTLSamplerState> sampler,
@@ -237,12 +141,12 @@ void Models::DrawFenceShadowCaster(id<MTLRenderCommandEncoder> encoder,
     }
 
     CameraCB fenceShadowCb = camera;
-    fenceShadowCb.view = lightView;
-    fenceShadowCb.proj = lightProj;
-    fenceShadowCb.world = FenceWorldMatrix(m_fencePosition, m_fenceSize,
-                                           m_fenceYawRadians,
-                                           m_fencePitchRadians,
-                                           m_fenceRollRadians);
+    fenceShadowCb.viewMatrix = lightViewMatrix;
+    fenceShadowCb.projectionMatrix = lightProjectionMatrix;
+    fenceShadowCb.modelMatrix = MatrixFactory::FenceWorld(m_fencePosition, m_fenceSize,
+                                                    m_fenceYawRadians,
+                                                    m_fencePitchRadians,
+                                                    m_fenceRollRadians);
 
     MaterialGPU fenceShadowMat = m_fenceMaterial;
     fenceShadowMat.detailParams.x = 0.0f;
@@ -307,9 +211,10 @@ void Models::DrawModel4Planes(id<MTLRenderCommandEncoder> encoder,
         }
 
         CameraCB localCb = camera;
-        localCb.world = simd_mul(simd_mul(MatTranslation(instance.worldOffset),
-                                          MatBillboardFacingCamera(instance.worldOffset, cameraPosition)),
-                                 MatScale(m_model4PlaneScale));
+        localCb.modelMatrix = simd_mul(simd_mul(MatrixFactory::Translation(instance.worldOffset),
+                                          MatrixFactory::BillboardFacingCamera(instance.worldOffset,
+                                                                               cameraPosition)),
+                                 MatrixFactory::UniformScale(m_model4PlaneScale));
         [encoder setVertexBytes:&localCb length:sizeof(CameraCB) atIndex:1];
         [encoder setVertexBytes:&m_model4PlaneMaterial length:sizeof(MaterialGPU) atIndex:2];
         [encoder setFragmentBytes:&m_model4PlaneMaterial length:sizeof(MaterialGPU) atIndex:1];
@@ -335,10 +240,10 @@ void Models::DrawFence(id<MTLRenderCommandEncoder> encoder,
     }
 
     CameraCB fenceCb = camera;
-    fenceCb.world = FenceWorldMatrix(m_fencePosition, m_fenceSize,
-                                     m_fenceYawRadians,
-                                     m_fencePitchRadians,
-                                     m_fenceRollRadians);
+    fenceCb.modelMatrix = MatrixFactory::FenceWorld(m_fencePosition, m_fenceSize,
+                                              m_fenceYawRadians,
+                                              m_fencePitchRadians,
+                                              m_fenceRollRadians);
 
     [encoder setRenderPipelineState:m_fenceGbufferPSO];
     [encoder setCullMode:MTLCullModeNone];
@@ -369,10 +274,10 @@ void Models::DrawFenceShadowDecal(id<MTLRenderCommandEncoder> encoder,
     }
 
     CameraCB shadowCb = camera;
-    shadowCb.world = FenceWorldMatrix(m_fenceShadowPosition, m_fenceShadowSize,
-                                      m_fenceShadowYawRadians,
-                                      m_fenceShadowPitchRadians,
-                                      m_fenceShadowRollRadians);
+    shadowCb.modelMatrix = MatrixFactory::FenceWorld(m_fenceShadowPosition, m_fenceShadowSize,
+                                               m_fenceShadowYawRadians,
+                                               m_fenceShadowPitchRadians,
+                                               m_fenceShadowRollRadians);
 
     [encoder setRenderPipelineState:m_fenceGbufferPSO];
     [encoder setCullMode:MTLCullModeNone];

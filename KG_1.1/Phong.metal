@@ -17,9 +17,9 @@ struct VertexIn
 
 struct CameraCB
 {
-    float4x4 world;
-    float4x4 view;
-    float4x4 proj;
+    float4x4 modelMatrix;
+    float4x4 viewMatrix;
+    float4x4 projectionMatrix;
     float3   lightDir;
     float    lightIntensity;
     float3   lightColor;
@@ -32,7 +32,7 @@ struct CameraCB
 
 struct ShadowCB
 {
-    float4x4 lightViewProj[4];
+    float4x4 lightViewProjectionMatrices[4];
     float4 cascadeSplits;
     float4 texelSizes;
     float4 params;
@@ -290,11 +290,11 @@ static float3 ApplyNormalMap(float3 baseNormal,
     return normalize(tbn * blendedTangentNormal);
 }
 
-vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
-                        constant CameraCB& cb [[buffer(1)]],
-                        constant MaterialCB& mat [[buffer(2)]],
-                        texture2d<float> heightTex [[texture(0)]],
-                        sampler linearSampler [[sampler(0)]])
+vertex VSOut vertex_shader_gbuffer(VertexIn vin [[stage_in]],
+                                   constant CameraCB& cb [[buffer(1)]],
+                                   constant MaterialCB& mat [[buffer(2)]],
+                                   texture2d<float> heightTex [[texture(0)]],
+                                   sampler linearSampler [[sampler(0)]])
 {
     VSOut o;
     const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
@@ -307,21 +307,21 @@ vertex VSOut vs_gbuffer(VertexIn vin [[stage_in]],
         displacedPosition += objectNormal * (height * mat.detailParams.x);
     }
 
-    float4 wp = cb.world * float4(displacedPosition, 1.0);
-    float4 vp = cb.view  * wp;
-    o.position = cb.proj * vp;
+    float4 wp = cb.modelMatrix * float4(displacedPosition, 1.0);
+    float4 vp = cb.viewMatrix  * wp;
+    o.position = cb.projectionMatrix * vp;
 
     o.worldPos = wp.xyz;
-    o.worldN = normalize((cb.world * float4(vin.normal, 0.0)).xyz);
+    o.worldN = normalize((cb.modelMatrix * float4(vin.normal, 0.0)).xyz);
     o.uv = uv;
     return o;
 }
 
-vertex float4 vs_shadow(VertexIn vin [[stage_in]],
-                        constant CameraCB& cb [[buffer(1)]],
-                        constant MaterialCB& mat [[buffer(2)]],
-                        texture2d<float> heightTex [[texture(0)]],
-                        sampler linearSampler [[sampler(0)]])
+vertex float4 vertex_shader_shadow(VertexIn vin [[stage_in]],
+                                   constant CameraCB& cb [[buffer(1)]],
+                                   constant MaterialCB& mat [[buffer(2)]],
+                                   texture2d<float> heightTex [[texture(0)]],
+                                   sampler linearSampler [[sampler(0)]])
 {
     const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
     float3 displacedPosition = vin.position;
@@ -331,8 +331,8 @@ vertex float4 vs_shadow(VertexIn vin [[stage_in]],
         displacedPosition += normalize(vin.normal) * (height * mat.detailParams.x);
     }
 
-    const float4 wp = cb.world * float4(displacedPosition, 1.0);
-    return cb.proj * cb.view * wp;
+    const float4 wp = cb.modelMatrix * float4(displacedPosition, 1.0);
+    return cb.projectionMatrix * cb.viewMatrix * wp;
 }
 
 struct FenceShadowVSOut
@@ -341,20 +341,20 @@ struct FenceShadowVSOut
     float2 uv;
 };
 
-vertex FenceShadowVSOut vs_fence_shadow(VertexIn vin [[stage_in]],
-                                        constant CameraCB& cb [[buffer(1)]],
-                                        constant MaterialCB& mat [[buffer(2)]])
+vertex FenceShadowVSOut vertex_shader_fence_shadow(VertexIn vin [[stage_in]],
+                                                   constant CameraCB& cb [[buffer(1)]],
+                                                   constant MaterialCB& mat [[buffer(2)]])
 {
-    const float4 wp = cb.world * float4(vin.position, 1.0);
+    const float4 wp = cb.modelMatrix * float4(vin.position, 1.0);
     FenceShadowVSOut o;
-    o.position = cb.proj * cb.view * wp;
+    o.position = cb.projectionMatrix * cb.viewMatrix * wp;
     o.uv = vin.uv * mat.uvScale;
     return o;
 }
 
-fragment void ps_fence_shadow(FenceShadowVSOut in [[stage_in]],
-                              texture2d<float> diffuseTex [[texture(0)]],
-                              sampler linearSampler [[sampler(0)]])
+fragment void fragment_shader_fence_shadow(FenceShadowVSOut in [[stage_in]],
+                                           texture2d<float> diffuseTex [[texture(0)]],
+                                           sampler linearSampler [[sampler(0)]])
 {
     const float alpha = diffuseTex.sample(linearSampler, in.uv).a;
     if (alpha < 0.5)
@@ -364,24 +364,24 @@ fragment void ps_fence_shadow(FenceShadowVSOut in [[stage_in]],
 }
 
 // ── Fence plane: gbuffer pass ─────────────────────────────────────────────────
-vertex VSOut vs_fence_gbuffer(VertexIn vin [[stage_in]],
-                              constant CameraCB& cb [[buffer(1)]],
-                              constant MaterialCB& mat [[buffer(2)]])
+vertex VSOut vertex_shader_fence_gbuffer(VertexIn vin [[stage_in]],
+                                         constant CameraCB& cb [[buffer(1)]],
+                                         constant MaterialCB& mat [[buffer(2)]])
 {
-    const float4 wp = cb.world * float4(vin.position, 1.0);
+    const float4 wp = cb.modelMatrix * float4(vin.position, 1.0);
     VSOut o;
-    o.position = cb.proj * cb.view * wp;
+    o.position = cb.projectionMatrix * cb.viewMatrix * wp;
     o.worldPos = wp.xyz;
-    o.worldN = normalize((cb.world * float4(vin.normal, 0.0)).xyz);
+    o.worldN = normalize((cb.modelMatrix * float4(vin.normal, 0.0)).xyz);
     o.uv = vin.uv * mat.uvScale;
     return o;
 }
 
-fragment GBufferOut ps_fence_gbuffer(VSOut in [[stage_in]],
-                                     constant CameraCB& cb [[buffer(0)]],
-                                     constant MaterialCB& mat [[buffer(1)]],
-                                     texture2d<float> diffuseTex [[texture(0)]],
-                                     sampler linearSampler [[sampler(0)]])
+fragment GBufferOut fragment_shader_fence_gbuffer(VSOut in [[stage_in]],
+                                                  constant CameraCB& cb [[buffer(0)]],
+                                                  constant MaterialCB& mat [[buffer(1)]],
+                                                  texture2d<float> diffuseTex [[texture(0)]],
+                                                  sampler linearSampler [[sampler(0)]])
 {
     const float4 diffuseSample = diffuseTex.sample(linearSampler, in.uv);
     if (diffuseSample.a < 0.5)
@@ -398,11 +398,11 @@ fragment GBufferOut ps_fence_gbuffer(VSOut in [[stage_in]],
     return outData;
 }
 
-vertex VSOut vs_particle_billboard(VertexIn vin [[stage_in]],
-                                   constant CameraCB& cb [[buffer(1)]],
-                                   constant MaterialCB& mat [[buffer(2)]],
-                                   const device ParticleInstance* instances [[buffer(3)]],
-                                   uint instanceId [[instance_id]])
+vertex VSOut vertex_shader_particle_billboard(VertexIn vin [[stage_in]],
+                                              constant CameraCB& cb [[buffer(1)]],
+                                              constant MaterialCB& mat [[buffer(2)]],
+                                              const device ParticleInstance* instances [[buffer(3)]],
+                                              uint instanceId [[instance_id]])
 {
     const ParticleInstance instance = instances[instanceId];
     const float3 center = instance.animatedCenterAndSeed.xyz;
@@ -422,22 +422,22 @@ vertex VSOut vs_particle_billboard(VertexIn vin [[stage_in]],
     const float2 uv = vin.uv * mat.uvScale + mat.uvSpeed * cb.timeSeconds;
     const float3 worldPos = center + right * (vin.position.x * size) + up * (vin.position.y * size);
     const float4 wp = float4(worldPos, 1.0);
-    const float4 vp = cb.view * wp;
+    const float4 vp = cb.viewMatrix * wp;
 
     VSOut o;
-    o.position = cb.proj * vp;
+    o.position = cb.projectionMatrix * vp;
     o.worldPos = worldPos;
     o.worldN = forward;
     o.uv = uv;
     return o;
 }
 
-fragment GBufferOut ps_gbuffer(VSOut in [[stage_in]],
-                               constant CameraCB& cb [[buffer(0)]],
-                               constant MaterialCB& mat [[buffer(1)]],
-                               texture2d<float> diffuseTex [[texture(0)]],
-                               texture2d<float> normalTex [[texture(1)]],
-                               sampler linearSampler [[sampler(0)]])
+fragment GBufferOut fragment_shader_gbuffer(VSOut in [[stage_in]],
+                                            constant CameraCB& cb [[buffer(0)]],
+                                            constant MaterialCB& mat [[buffer(1)]],
+                                            texture2d<float> diffuseTex [[texture(0)]],
+                                            texture2d<float> normalTex [[texture(1)]],
+                                            sampler linearSampler [[sampler(0)]])
 {
     float3 baseColor = mat.kd_ns.rgb;
     float alpha = 1.0;
@@ -481,7 +481,7 @@ struct FullscreenOut
     float2 uv;
 };
 
-vertex FullscreenOut vs_fullscreen(uint vid [[vertex_id]])
+vertex FullscreenOut vertex_shader_fullscreen(uint vid [[vertex_id]])
 {
     FullscreenOut o;
 
@@ -499,12 +499,12 @@ vertex FullscreenOut vs_fullscreen(uint vid [[vertex_id]])
     return o;
 }
 
-fragment float4 ps_gbuffer_stub(FullscreenOut in [[stage_in]],
-                                texture2d<float> gbufferAlbedo [[texture(0)]],
-                                texture2d<float> gbufferNormal [[texture(1)]],
-                                texture2d<float> gbufferPosition [[texture(2)]],
-                                texture2d<float> gbufferMaterial [[texture(3)]],
-                                sampler linearSampler [[sampler(0)]])
+fragment float4 fragment_shader_gbuffer_stub(FullscreenOut in [[stage_in]],
+                                             texture2d<float> gbufferAlbedo [[texture(0)]],
+                                             texture2d<float> gbufferNormal [[texture(1)]],
+                                             texture2d<float> gbufferPosition [[texture(2)]],
+                                             texture2d<float> gbufferMaterial [[texture(3)]],
+                                             sampler linearSampler [[sampler(0)]])
 {
     const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
 
@@ -521,6 +521,76 @@ fragment float4 ps_gbuffer_stub(FullscreenOut in [[stage_in]],
     (void)specularPower;
 
     return float4(albedo.rgb, 1.0);
+}
+
+struct TAAParams
+{
+    float4x4 previousViewProjectionMatrix;
+    float4 renderSizeAndBlend;
+    float4 flags;
+};
+
+fragment float4 fragment_shader_copy_texture(FullscreenOut in [[stage_in]],
+                                             texture2d<float> sourceTexture [[texture(0)]],
+                                             sampler linearSampler [[sampler(0)]])
+{
+    const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
+    return float4(sourceTexture.sample(linearSampler, uv).rgb, 1.0);
+}
+
+fragment float4 fragment_shader_taa_resolve(FullscreenOut in [[stage_in]],
+                                            constant TAAParams& params [[buffer(0)]],
+                                            texture2d<float> currentTexture [[texture(0)]],
+                                            texture2d<float> historyTexture [[texture(1)]],
+                                            texture2d<float> gbufferPosition [[texture(2)]],
+                                            texture2d<float> gbufferAlbedo [[texture(3)]],
+                                            sampler linearSampler [[sampler(0)]])
+{
+    const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
+    const float2 invSize = 1.0 / max(params.renderSizeAndBlend.xy, float2(1.0));
+    const float3 currentColor = currentTexture.sample(linearSampler, uv).rgb;
+
+    float3 neighborhoodMin = currentColor;
+    float3 neighborhoodMax = currentColor;
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            const float2 sampleUv = clamp(uv + float2(float(x), float(y)) * invSize,
+                                          float2(0.0),
+                                          float2(1.0));
+            const float3 sampleColor = currentTexture.sample(linearSampler, sampleUv).rgb;
+            neighborhoodMin = min(neighborhoodMin, sampleColor);
+            neighborhoodMax = max(neighborhoodMax, sampleColor);
+        }
+    }
+
+    const float4 albedoSample = gbufferAlbedo.sample(linearSampler, uv);
+    float2 historyUv = uv;
+    if (albedoSample.a >= 0.5)
+    {
+        const float3 worldPos = gbufferPosition.sample(linearSampler, uv).xyz;
+        const float4 previousClip = params.previousViewProjectionMatrix * float4(worldPos, 1.0);
+        if (abs(previousClip.w) > 0.0001)
+        {
+            const float2 previousNdc = previousClip.xy / previousClip.w;
+            historyUv = float2(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
+        }
+    }
+
+    const bool resetHistory = params.flags.x > 0.5 ||
+                              any(historyUv < float2(0.0)) ||
+                              any(historyUv > float2(1.0));
+    if (resetHistory)
+    {
+        return float4(currentColor, 1.0);
+    }
+
+    float3 historyColor = historyTexture.sample(linearSampler, historyUv).rgb;
+    historyColor = clamp(historyColor, neighborhoodMin, neighborhoodMax);
+
+    const float historyWeight = clamp(params.renderSizeAndBlend.z, 0.0, 0.98);
+    return float4(mix(currentColor, historyColor, historyWeight), 1.0);
 }
 
 static float SampleShadowMap(depth2d<float> shadowMap,
@@ -752,14 +822,14 @@ static float3 SampleLightingColor(float2 uv,
     const float3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
     const float3 diffuse = (1.0  - F) * (1.0 - metallic) * albedo / 3.14159265359;
     const float3 directionalRadiance = cb.lightColor * cb.lightIntensity;
-    const float viewDepth = -(cb.view * float4(worldPos, 1.0)).z;
+    const float viewDepth = -(cb.viewMatrix * float4(worldPos, 1.0)).z;
 
     uint cascadeIndex = 0u;
     if (viewDepth > shadowCb.cascadeSplits.x) cascadeIndex = 1u;
     if (viewDepth > shadowCb.cascadeSplits.y) cascadeIndex = 2u;
     if (viewDepth > shadowCb.cascadeSplits.z) cascadeIndex = 3u;
 
-    const float4 lightClip = shadowCb.lightViewProj[cascadeIndex] * float4(worldPos, 1.0);
+    const float4 lightClip = shadowCb.lightViewProjectionMatrices[cascadeIndex] * float4(worldPos, 1.0);
     const float3 lightNdc = lightClip.xyz / lightClip.w;
     const float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 1.0 - (lightNdc.y * 0.5 + 0.5));
     const float shadowDepth = lightNdc.z;
@@ -864,22 +934,22 @@ static float3 ApplyEyeAdaptationPostProcess(float3 color,
     return saturate(adaptedColor / (adaptedColor + float3(0.18)));
 }
 
-fragment float4 ps_lighting(FullscreenOut in [[stage_in]],
-                            constant CameraCB& cb [[buffer(0)]],
-                            constant ShadowCB& shadowCb [[buffer(1)]],
-                            texture2d<float> gbufferAlbedo [[texture(0)]],
-                            texture2d<float> gbufferNormal [[texture(1)]],
-                            texture2d<float> gbufferPosition [[texture(2)]],
-                            texture2d<float> gbufferMaterial [[texture(3)]],
-                            depth2d<float> shadowMap0 [[texture(4)]],
-                            depth2d<float> shadowMap1 [[texture(5)]],
-                            depth2d<float> shadowMap2 [[texture(6)]],
-                            depth2d<float> shadowMap3 [[texture(7)]],
-                            texturecube<float> irradianceMap [[texture(8)]],
-                            texture2d<float> brdfLut [[texture(9)]],
-                            texturecube<float> prefilteredMap [[texture(10)]],
-                            sampler linearSampler [[sampler(0)]],
-                            sampler shadowSampler [[sampler(1)]])
+fragment float4 fragment_shader_lighting(FullscreenOut in [[stage_in]],
+                                         constant CameraCB& cb [[buffer(0)]],
+                                         constant ShadowCB& shadowCb [[buffer(1)]],
+                                         texture2d<float> gbufferAlbedo [[texture(0)]],
+                                         texture2d<float> gbufferNormal [[texture(1)]],
+                                         texture2d<float> gbufferPosition [[texture(2)]],
+                                         texture2d<float> gbufferMaterial [[texture(3)]],
+                                         depth2d<float> shadowMap0 [[texture(4)]],
+                                         depth2d<float> shadowMap1 [[texture(5)]],
+                                         depth2d<float> shadowMap2 [[texture(6)]],
+                                         depth2d<float> shadowMap3 [[texture(7)]],
+                                         texturecube<float> irradianceMap [[texture(8)]],
+                                         texture2d<float> brdfLut [[texture(9)]],
+                                         texturecube<float> prefilteredMap [[texture(10)]],
+                                         sampler linearSampler [[sampler(0)]],
+                                         sampler shadowSampler [[sampler(1)]])
 {
     const float2 uv = clamp(in.uv, float2(0.0), float2(1.0));
     float3 color = SampleLightingColor(uv,

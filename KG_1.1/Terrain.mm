@@ -132,6 +132,27 @@ static bool IsSphereVisibleInFrustum(const simd::float4x4& viewMatrix,
     return true;
 }
 
+static void AppendTwoSidedQuad(std::vector<uint32_t>& indices,
+                               uint32_t topA,
+                               uint32_t topB,
+                               uint32_t bottomA,
+                               uint32_t bottomB)
+{
+    indices.push_back(topA);
+    indices.push_back(bottomA);
+    indices.push_back(topB);
+    indices.push_back(topB);
+    indices.push_back(bottomA);
+    indices.push_back(bottomB);
+
+    indices.push_back(topB);
+    indices.push_back(bottomA);
+    indices.push_back(topA);
+    indices.push_back(bottomB);
+    indices.push_back(bottomA);
+    indices.push_back(topB);
+}
+
 void Terrain::CreateResources(id<MTLDevice> device, TextureLoader textureLoader)
 {
     m_device = device;
@@ -525,6 +546,39 @@ void Terrain::UpdateMesh(const simd::float4x4& viewMatrix,
                 indices.push_back(i2);
                 indices.push_back(i3);
             }
+        }
+
+        const auto addSkirtVertex = [&](uint32_t sourceIndex) -> uint32_t
+        {
+            VertexPNT skirtVertex = vertices[sourceIndex];
+            skirtVertex.py -= m_skirtDepth;
+            vertices.push_back(skirtVertex);
+            return (uint32_t)vertices.size() - 1u;
+        };
+
+        for (uint32_t x = 0; x < r; ++x)
+        {
+            const uint32_t topA = vertexBase + x;
+            const uint32_t topB = topA + 1u;
+            AppendTwoSidedQuad(indices, topA, topB, addSkirtVertex(topA), addSkirtVertex(topB));
+        }
+        for (uint32_t z = 0; z < r; ++z)
+        {
+            const uint32_t topA = vertexBase + z * vertsPerSide + r;
+            const uint32_t topB = topA + vertsPerSide;
+            AppendTwoSidedQuad(indices, topA, topB, addSkirtVertex(topA), addSkirtVertex(topB));
+        }
+        for (uint32_t x = 0; x < r; ++x)
+        {
+            const uint32_t topA = vertexBase + r * vertsPerSide + (r - x);
+            const uint32_t topB = topA - 1u;
+            AppendTwoSidedQuad(indices, topA, topB, addSkirtVertex(topA), addSkirtVertex(topB));
+        }
+        for (uint32_t z = 0; z < r; ++z)
+        {
+            const uint32_t topA = vertexBase + (r - z) * vertsPerSide;
+            const uint32_t topB = topA - vertsPerSide;
+            AppendTwoSidedQuad(indices, topA, topB, addSkirtVertex(topA), addSkirtVertex(topB));
         }
 
         DrawBatch batch;

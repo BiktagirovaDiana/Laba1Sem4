@@ -104,4 +104,5 @@ private:
     uint32_t m_maxDepth = 6;
     uint32_t m_patchResolution = 8;
     float m_lodDistanceFactor = 1.75f;
+    float m_skirtDepth = 10.0f;
 };

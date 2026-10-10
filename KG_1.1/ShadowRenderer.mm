@@ -1,41 +1,8 @@
 #import "ShadowRenderer.hpp"
+#include "MatrixFactory.hpp"
 #import <Foundation/Foundation.h>
 
 #include <cmath>
-
-static simd::float4x4 LookAtRH(simd::float3 eye, simd::float3 at, simd::float3 up)
-{
-    simd::float3 z = simd::normalize(eye - at);
-    simd::float3 x = simd::normalize(simd::cross(up, z));
-    simd::float3 y = simd::cross(z, x);
-
-    simd::float4x4 m;
-    m.columns[0] = simd::float4{x.x, y.x, z.x, 0.0f};
-    m.columns[1] = simd::float4{x.y, y.y, z.y, 0.0f};
-    m.columns[2] = simd::float4{x.z, y.z, z.z, 0.0f};
-    m.columns[3] = simd::float4{
-        -simd::dot(x, eye),
-        -simd::dot(y, eye),
-        -simd::dot(z, eye),
-         1.0f
-    };
-    return m;
-}
-
-static simd::float4x4 OrthoRH(float left, float right, float bottom, float top, float zn, float zf)
-{
-    simd::float4x4 m = {};
-    m.columns[0] = simd::float4{2.0f / (right - left), 0.0f, 0.0f, 0.0f};
-    m.columns[1] = simd::float4{0.0f, 2.0f / (top - bottom), 0.0f, 0.0f};
-    m.columns[2] = simd::float4{0.0f, 0.0f, 1.0f / (zn - zf), 0.0f};
-    m.columns[3] = simd::float4{
-        -(right + left) / (right - left),
-        -(top + bottom) / (top - bottom),
-        zn / (zn - zf),
-        1.0f
-    };
-    return m;
-}
 
 void ShadowRenderer::CreateResources(id<MTLDevice> device)
 {
@@ -63,9 +30,9 @@ void ShadowRenderer::CreatePipelines(id<MTLDevice> device,
 {
     NSError* err = nil;
 
-    id<MTLFunction> vsShadow = [library newFunctionWithName:@"vs_shadow"];
+    id<MTLFunction> vertexShaderShadow = [library newFunctionWithName:@"vertex_shader_shadow"];
     MTLRenderPipelineDescriptor* shadowDesc = [MTLRenderPipelineDescriptor new];
-    shadowDesc.vertexFunction = vsShadow;
+    shadowDesc.vertexFunction = vertexShaderShadow;
     shadowDesc.fragmentFunction = nil;
     shadowDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     shadowDesc.vertexDescriptor = vertexDescriptor;
@@ -73,11 +40,11 @@ void ShadowRenderer::CreatePipelines(id<MTLDevice> device,
     m_shadowPSO = [device newRenderPipelineStateWithDescriptor:shadowDesc error:&err];
     if (!m_shadowPSO) { NSLog(@"Shadow PSO error: %@", err); }
 
-    id<MTLFunction> vsFenceShadow = [library newFunctionWithName:@"vs_fence_shadow"];
-    id<MTLFunction> psFenceShadow = [library newFunctionWithName:@"ps_fence_shadow"];
+    id<MTLFunction> vertexShaderFenceShadow = [library newFunctionWithName:@"vertex_shader_fence_shadow"];
+    id<MTLFunction> fragmentShaderFenceShadow = [library newFunctionWithName:@"fragment_shader_fence_shadow"];
     MTLRenderPipelineDescriptor* fenceShadowDesc = [MTLRenderPipelineDescriptor new];
-    fenceShadowDesc.vertexFunction = vsFenceShadow;
-    fenceShadowDesc.fragmentFunction = psFenceShadow;
+    fenceShadowDesc.vertexFunction = vertexShaderFenceShadow;
+    fenceShadowDesc.fragmentFunction = fragmentShaderFenceShadow;
     fenceShadowDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     fenceShadowDesc.vertexDescriptor = vertexDescriptor;
 
@@ -117,7 +84,7 @@ void ShadowRenderer::ResetConstantBuffer()
     shadowCb->params = simd::float4{0.0018f, 0.0065f, 0.58f, m_enabled ? 4.0f : 0.0f};
     for (uint32_t i = 0; i < kCascadeCount; ++i)
     {
-        shadowCb->lightViewProj[i] = matrix_identity_float4x4;
+        shadowCb->lightViewProjectionMatrices[i] = matrix_identity_float4x4;
         shadowCb->texelSizes[i] = 1.0f / (float)kMapSize;
     }
 }
@@ -197,18 +164,18 @@ void ShadowRenderer::RenderCascades(id<MTLCommandBuffer> commandBuffer,
         }
         cascadeRadius = ceilf(cascadeRadius * 16.0f) / 16.0f;
 
-        const simd::float4x4 lightView =
-            LookAtRH(cascadeCenter - lightDir * (cascadeRadius * 2.0f),
-                     cascadeCenter,
-                     simd::float3{0.0f, 1.0f, 0.0f});
-        const simd::float4x4 lightProj =
-            OrthoRH(-cascadeRadius,
-                    cascadeRadius,
-                    -cascadeRadius,
-                    cascadeRadius,
-                    0.1f,
-                    cascadeRadius * 4.0f);
-        shadowCb->lightViewProj[cascadeIndex] = simd_mul(lightProj, lightView);
+        const simd::float4x4 lightViewMatrix =
+            MatrixFactory::LookAtRH(cascadeCenter - lightDir * (cascadeRadius * 2.0f),
+                                    cascadeCenter,
+                                    simd::float3{0.0f, 1.0f, 0.0f});
+        const simd::float4x4 lightProjectionMatrix =
+            MatrixFactory::OrthoRH(-cascadeRadius,
+                                   cascadeRadius,
+                                   -cascadeRadius,
+                                   cascadeRadius,
+                                   0.1f,
+                                   cascadeRadius * 4.0f);
+        shadowCb->lightViewProjectionMatrices[cascadeIndex] = simd_mul(lightProjectionMatrix, lightViewMatrix);
 
         if (!m_maps[cascadeIndex])
         {
@@ -232,7 +199,7 @@ void ShadowRenderer::RenderCascades(id<MTLCommandBuffer> commandBuffer,
 
             if (drawCascade)
             {
-                drawCascade(shadowEnc, lightView, lightProj, m_shadowPSO, m_fenceShadowPSO);
+                drawCascade(shadowEnc, lightViewMatrix, lightProjectionMatrix, m_shadowPSO, m_fenceShadowPSO);
             }
 
             [shadowEnc endEncoding];

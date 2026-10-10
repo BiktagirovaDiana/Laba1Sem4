@@ -7,7 +7,7 @@
 
 struct ShadowCB
 {
-    simd::float4x4 lightViewProj[4];
+    simd::float4x4 lightViewProjectionMatrices[4];
     simd::float4 cascadeSplits = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 texelSizes = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 params = {0.0025f, 0.02f, 0.62f, 4.0f};
@@ -21,8 +21,8 @@ public:
 
     using DrawCascadeCallback =
         std::function<void(id<MTLRenderCommandEncoder> encoder,
-                           const simd::float4x4& lightView,
-                           const simd::float4x4& lightProj,
+                           const simd::float4x4& lightViewMatrix,
+                           const simd::float4x4& lightProjectionMatrix,
                            id<MTLRenderPipelineState> shadowPSO,
                            id<MTLRenderPipelineState> fenceShadowPSO)>;
 

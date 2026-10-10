@@ -61,9 +61,9 @@ void ParticleRenderer::CreatePipelines(id<MTLDevice> device,
 {
     NSError* err = nil;
 
-    id<MTLFunction> vsParticleBillboard = [library newFunctionWithName:@"vs_particle_billboard"];
+    id<MTLFunction> vertexShaderParticleBillboard = [library newFunctionWithName:@"vertex_shader_particle_billboard"];
     MTLRenderPipelineDescriptor* particleDesc = [gbufferPipelineDescriptor copy];
-    particleDesc.vertexFunction = vsParticleBillboard;
+    particleDesc.vertexFunction = vertexShaderParticleBillboard;
     m_billboardPSO = [device newRenderPipelineStateWithDescriptor:particleDesc error:&err];
     if (!m_billboardPSO) { NSLog(@"Particle billboard PSO error: %@", err); }
 

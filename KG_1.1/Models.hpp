@@ -9,9 +9,9 @@
 
 struct CameraCB
 {
-    simd::float4x4 world;
-    simd::float4x4 view;
-    simd::float4x4 proj;
+    simd::float4x4 modelMatrix;
+    simd::float4x4 viewMatrix;
+    simd::float4x4 projectionMatrix;
     simd::float3   lightDir;
     float          lightIntensity;
     simd::float3   lightColor;
@@ -38,8 +38,8 @@ public:
 
     void DrawFenceShadowCaster(id<MTLRenderCommandEncoder> encoder,
                                const CameraCB& camera,
-                               const simd::float4x4& lightView,
-                               const simd::float4x4& lightProj,
+                               const simd::float4x4& lightViewMatrix,
+                               const simd::float4x4& lightProjectionMatrix,
                                id<MTLRenderPipelineState> fenceShadowPSO,
                                id<MTLRenderPipelineState> restorePSO,
                                id<MTLSamplerState> sampler,

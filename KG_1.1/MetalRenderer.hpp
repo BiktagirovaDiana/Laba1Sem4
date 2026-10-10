@@ -9,6 +9,7 @@
 #include "Particle.hpp"
 #include "Scene.hpp"
 #include "ShadowRenderer.hpp"
+#include "TAA.hpp"
 #include "Terrain.hpp"
 
 class MetalRenderer
@@ -49,6 +50,7 @@ private:
     id<MTLTexture>             m_prefilteredMap = nil;
     id<MTLSamplerState>        m_sampler = nil;
     GBuffer                    m_gbuffer;
+    TAA                        m_taa;
 
     id<MTLBuffer> m_cameraCB = nil;
 
@@ -88,9 +90,13 @@ private:
     bool m_enableVintagePostProcess = false;
     bool m_enableChromaticAberration = false;
     bool m_enableEyeAdaptationPostProcess = false;
+    bool m_enableTAA = true;
     bool m_useBeckmannNDF = false;
     float m_model4PlaneSwapDistance = 200.0f;
     float m_model4PlaneSwapHysteresis = 25.0f;
+    uint32_t m_taaFrameIndex = 0;
+    bool m_hasPreviousViewProjectionMatrix = false;
+    simd::float4x4 m_previousViewProjectionMatrix = matrix_identity_float4x4;
 
     void CreateTerrainResources();
     void CreateModelResources();
